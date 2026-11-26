@@ -1,0 +1,26 @@
+{
+  "name": "pica-mcp",
+  "version": "0.1.0",
+  "description": "Ultra-lightweight headless-first 2D vector design and animation MCP server",
+  "type": "module",
+  "bin": {
+    "pica": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/index.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.4.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "hono": "^4.13.22",
+    "linkedom": "^0.18.15",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.5",
+    "typescript": "^7.0.2"
+  }
+}
