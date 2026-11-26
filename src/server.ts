@@ -61,7 +61,7 @@ export function createServer(): McpServer {
     "pica_inspect",
     {
       title: "Inspect preview",
-      description: "Render a preview PNG. timeMs=0 uses resvg; timeMs>0 captures the exact animation timestamp via headless Chromium. Optional grid/id overlays.",
+      description: "Render a preview PNG. Static designs at timeMs=0 use resvg; animated designs (and any timeMs>0) capture via headless Chromium CDP when available, else static resvg fallback at timeMs=0. Optional grid/id overlays.",
       inputSchema: InspectSchema,
     },
     async (args) => handleInspect(args),

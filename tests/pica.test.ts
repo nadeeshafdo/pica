@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { captureFrames, closeBrowser, findChromeBinary } from "../src/chromium.js";
 import { extractKeyframesBody } from "../src/pica-file.js";
-import { renderPixels, renderPngBuffer } from "../src/render.js";
+import { normalizeFontAliases, renderPixels, renderPngBuffer } from "../src/render.js";
 import { handleAnimate, handleCreate, handleExport, handleInspect, handlePatch, handleRead } from "../src/tools.js";
 
 function ffmpegAvailable(): boolean {
@@ -485,8 +485,23 @@ describe("chromium", () => {
     }
   }, 180000);
 
+  test("normalizeFontAliases only touches font-family declarations", () => {
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">` +
+      `<style>.a{font-family: Inter, system-ui, sans-serif}</style>` +
+      `<text x="10" y="50" font-family="Inter, system-ui, -apple-system, BlinkMacSystemFont, sans-serif">Use system-ui font</text>` +
+      `</svg>`;
+    const out = normalizeFontAliases(svg);
+    expect(out).toContain(`font-family="Inter, sans-serif, sans-serif, sans-serif, sans-serif"`);
+    expect(out).toContain(`font-family: Inter, sans-serif, sans-serif`);
+    expect(out).toContain(`>Use system-ui font</text>`);
+  });
+
   test("captureFrames produces exact integer frame counts", async () => {
-    if (!findChromeBinary()) throw new Error("chromium required for frame-count test");
+    if (!findChromeBinary()) {
+      console.error("skip frame-count test: chromium missing");
+      return;
+    }
     const svg =
       `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">` +
       `<rect width="64" height="64" fill="#111113"/>` +
@@ -505,7 +520,10 @@ describe("chromium", () => {
   }, 180000);
 
   test("parallel timed inspects serialize through the CDP lock", async () => {
-    if (!findChromeBinary()) throw new Error("chromium required for parallel inspect test");
+    if (!findChromeBinary()) {
+      console.error("skip parallel inspect test: chromium missing");
+      return;
+    }
     const dir = await mkdtemp(join(tmpdir(), "pica-par-"));
     try {
       const path = join(dir, "par.pica.svg");

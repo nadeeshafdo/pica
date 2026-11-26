@@ -105,7 +105,7 @@ export type AnimateInput = z.infer<typeof AnimateSchema>;
 
 export const InspectSchema = z.object({
   path: z.string().min(1).describe("Input .pica.svg file path"),
-  timeMs: z.number().min(0).default(0).describe("Animation timestamp to capture (0 = headless resvg)"),
+  timeMs: z.number().min(0).default(0).describe("Animation timestamp in ms. Static designs render via resvg; animated designs (and any timeMs>0) capture via headless Chromium CDP when available, else static resvg fallback at timeMs=0"),
   showGrid: z.boolean().default(false).describe("Overlay subtle 100px grid (non-persisted)"),
   showIds: z.boolean().default(false).describe("Overlay #id bounding-box badges (non-persisted)"),
   scale: z.number().positive().max(4).default(1).describe("Render scale factor"),

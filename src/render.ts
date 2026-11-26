@@ -28,13 +28,20 @@ function resolveFontFamilies(): { sans: string; serif: string; mono: string } {
 /**
  * usvg drops <text> when font-family lists unknown names (Inter, system-ui,
  * ...) with no usable fallback. Normalize CSS generic aliases the renderer
- * may not know to plain generics. Render-only: the saved file is untouched.
+ * may not know, scoped to font-family declarations only so <text> content
+ * is never touched. Render-only: the saved file is untouched.
  */
-function normalizeFontAliases(svgText: string): string {
-  return svgText
+function normalizeAliasList(value: string): string {
+  return value
     .replace(/system-ui/gi, "sans-serif")
     .replace(/-apple-system/gi, "sans-serif")
     .replace(/BlinkMacSystemFont/gi, "sans-serif");
+}
+
+export function normalizeFontAliases(svgText: string): string {
+  return svgText
+    .replace(/font-family\s*=\s*("[^"]*"|'[^']*')/gi, (m) => normalizeAliasList(m))
+    .replace(/font-family\s*:\s*[^;}"']+/gi, (m) => normalizeAliasList(m));
 }
 
 function buildResvg(svgText: string, scale: number): Resvg {
