@@ -18,7 +18,7 @@ import {
 import { renderPngBuffer } from "./render.js";
 import { captureFrames, chromeMissingMessage, findChromeBinary, getExactBboxes, screenshotAtTime } from "./chromium.js";
 import { exportAnimated, exportPng, exportStaticRaster, exportSvgClean } from "./export.js";
-import { notifyPreview, setCurrentSvg } from "./preview.js";
+import { setCurrentSvg } from "./preview.js";
 
 // ---------- Zod schemas ----------
 
@@ -40,7 +40,7 @@ export const ReadSchema = z.object({
 });
 export type ReadInput = z.infer<typeof ReadSchema>;
 
-const AttrsRecord = z.record(z.string(), z.union([z.string(), z.number()]));
+const AttrsRecord = z.record(z.string(), z.union([z.string(), z.number(), z.null()]));
 
 export const PatchOpSchema = z.discriminatedUnion("op", [
   z.object({
@@ -90,6 +90,7 @@ export const AnimateTargetSchema = z.object({
   iterations: z.union([z.number().positive(), z.string()]).optional().describe("Count or 'infinite'"),
   direction: z.string().optional().describe("normal, reverse, alternate, alternate-reverse"),
   fill: z.string().optional().describe("none, forwards, backwards, both"),
+  transformOrigin: z.string().optional().describe('CSS transform-origin, e.g. "center", "50% 50%", "left top"'),
 });
 export type AnimateTarget = z.infer<typeof AnimateTargetSchema>;
 
@@ -108,6 +109,7 @@ export const InspectSchema = z.object({
   showGrid: z.boolean().default(false).describe("Overlay subtle 100px grid (non-persisted)"),
   showIds: z.boolean().default(false).describe("Overlay #id bounding-box badges (non-persisted)"),
   scale: z.number().positive().max(4).default(1).describe("Render scale factor"),
+  maxWidth: z.number().int().positive().max(8192).default(1024).describe("Cap preview width in px (effective scale is reduced to fit)"),
 });
 export type InspectInput = z.infer<typeof InspectSchema>;
 
@@ -161,7 +163,6 @@ export async function handleCreate(input: z.input<typeof CreateSchema>): Promise
     assertNoScript(svg);
     await atomicWriteFile(input.path, svg);
     setCurrentSvg(input.path, svg);
-    await notifyPreview(input.path).catch(() => undefined);
     return okText({
       ok: true,
       path: input.path,
@@ -225,25 +226,40 @@ export async function handleRead(input: z.input<typeof ReadSchema>): Promise<Too
 const PROTECTED_IDS = new Set(["pica-meta", "pica-defs", "pica-anim", "pica-bg", "pica-root"]);
 const SVG_NS = "http://www.w3.org/2000/svg";
 
+const ID_RE = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
+
 function sanitizeTag(tag: string): void {
   if (/^script$/i.test(tag)) throw new Error("Rejected: <script> elements are not allowed.");
   if (!/^[A-Za-z][\w-]*$/.test(tag)) throw new Error(`Invalid tag name: ${tag}.`);
 }
 
-function sanitizeAttrs(attrs: Record<string, string | number> | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
+function sanitizeAttrs(attrs: Record<string, string | number | null> | undefined): Record<string, string | null> {
+  const out: Record<string, string | null> = {};
   if (!attrs) return out;
   for (const [k, v] of Object.entries(attrs)) {
     if (/^on/i.test(k)) throw new Error(`Rejected: event-handler attribute '${k}' is not allowed.`);
+    if (v === null) {
+      out[k] = null;
+      continue;
+    }
     const val = String(v);
     if (/javascript\s*:/i.test(val)) throw new Error(`Rejected: javascript: URL in attribute '${k}'.`);
-    if (/^script$/i.test(val)) throw new Error("Rejected: <script> is not allowed.");
     out[k] = val;
   }
   if (Object.keys(out).some((k) => /^script$/i.test(k))) {
     throw new Error("Rejected: <script> is not allowed.");
   }
   return out;
+}
+
+function sanitizeDefsSvg(defsSvg: string): void {
+  assertNoScript(defsSvg);
+  if (/\son\w+\s*=/i.test(defsSvg)) {
+    throw new Error("Rejected: event-handler attributes (on*) are not allowed in defs.");
+  }
+  if (/javascript\s*:/i.test(defsSvg)) {
+    throw new Error("Rejected: javascript: URLs are not allowed in defs.");
+  }
 }
 
 export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<ToolResult> {
@@ -261,16 +277,24 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
     for (const op of input.ops) {
       if (op.op === "add") {
         sanitizeTag(op.tag);
-        const attrs = sanitizeAttrs(op.attrs);
-        if (op.textContent && /<script[\s>]/i.test(op.textContent)) {
-          throw new Error("Rejected: <script> elements are not allowed.");
+        if (!ID_RE.test(op.id)) {
+          throw new Error(
+            `pica_patch add failed: invalid id '#${op.id}'. Use /^[a-zA-Z_][a-zA-Z0-9_-]*$/.`,
+          );
         }
+        const attrs = sanitizeAttrs(op.attrs);
+        if (op.textContent) assertNoScript(op.textContent);
         if (getElById(doc, op.id)) throw new Error(`pica_patch add failed: id '#${op.id}' already exists.`);
         const parent = getElById(doc, op.parentId ?? "pica-root");
         if (!parent) throw new Error(`pica_patch add failed: parent '#${op.parentId ?? "pica-root"}' not found.`);
         const el = doc.createElementNS(SVG_NS, op.tag);
         el.setAttribute("id", op.id);
-        for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+        for (const [k, v] of Object.entries(attrs)) {
+          if (v === null) {
+            throw new Error(`pica_patch add failed: attribute '${k}' cannot be null on add.`);
+          }
+          el.setAttribute(k, v);
+        }
         if (op.textContent !== undefined) el.textContent = op.textContent;
         if (op.position !== undefined) {
           const idx = op.position;
@@ -288,9 +312,12 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
         const el = getElById(doc, op.id);
         if (!el) throw new Error(`pica_patch update failed: target '#${op.id}' not found.`);
         const attrs = sanitizeAttrs(op.attrs);
-        for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+        for (const [k, v] of Object.entries(attrs)) {
+          if (v === null) el.removeAttribute(k);
+          else el.setAttribute(k, v);
+        }
         if (op.textContent !== undefined) {
-          if (/<script[\s>]/i.test(op.textContent)) throw new Error("Rejected: <script> elements are not allowed.");
+          assertNoScript(op.textContent);
           el.textContent = op.textContent;
         }
       } else if (op.op === "remove") {
@@ -309,6 +336,14 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
         const newParentId = op.parentId ?? (el.parentElement?.getAttribute("id") ?? "pica-root");
         const newParent = getElById(doc, newParentId);
         if (!newParent) throw new Error(`pica_patch reorder failed: parent '#${newParentId}' not found.`);
+        // Guard: never move an element into itself or one of its descendants.
+        let cursor: Element | null = newParent;
+        while (cursor) {
+          if (cursor === el) {
+            throw new Error(`pica_patch reorder failed: cannot move '#${op.id}' into itself or its own descendant.`);
+          }
+          cursor = cursor.parentElement;
+        }
         el.remove();
         if (op.beforeId) {
           const ref = getElById(doc, op.beforeId);
@@ -328,7 +363,7 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
           newParent.appendChild(el);
         }
       } else if (op.op === "setDefs") {
-        assertNoScript(op.defsSvg);
+        sanitizeDefsSvg(op.defsSvg);
         const wrapped = `<svg xmlns="${SVG_NS}"><defs>${op.defsSvg}</defs></svg>`;
         assertWellFormedXml(wrapped);
         const defs = getElById(doc, "pica-defs");
@@ -343,7 +378,6 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
     assertWellFormedXml(out);
     await atomicWriteFile(input.path, out);
     setCurrentSvg(input.path, out);
-    await notifyPreview(input.path).catch(() => undefined);
     return okText({ ok: true, path: input.path, applied: input.ops.length });
   } catch (e) {
     return errText(`pica_patch failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -378,28 +412,50 @@ function removeKeyframesBlock(css: string, name: string): string {
   return out;
 }
 
+function animationTokenRe(name: string): RegExp {
+  return new RegExp(`(?<![A-Za-z0-9_-])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9_-])`);
+}
+
 function removeRulesReferencing(css: string, name: string): string {
+  const re = animationTokenRe(name);
   return css.replace(/#([A-Za-z0-9_-]+)\s*\{([^}]*)\}/g, (full, _id: string, body: string) => {
-    if (body.includes(name)) return "";
+    if (re.test(body)) return "";
     return full;
   });
 }
 
-function upsertIdRule(css: string, id: string, animationValue: string): string {
+function upsertIdRule(css: string, id: string, animationValue: string, origin: string): string {
   const re = new RegExp(`#${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "g");
-  const decl = `animation: ${animationValue};`;
+  const boxDecl = "transform-box: fill-box;";
+  const originDecl = `transform-origin: ${origin};`;
+  const animDecl = `animation: ${animationValue};`;
   let found = false;
   const next = css.replace(re, (full: string, body: string) => {
     found = true;
-    if (/animation\s*:/.test(body)) {
-      return full.replace(/animation\s*:[^;]+;?/, decl);
+    let updated = body;
+    // Replace or append animation declaration.
+    if (/animation\s*:/.test(updated)) {
+      updated = updated.replace(/animation\s*:[^;]+;?/, animDecl);
+    } else {
+      const t = updated.trim();
+      updated = `${updated}${t.length > 0 && !t.endsWith(";") ? ";" : ""} ${animDecl}`;
     }
-    const trimmed = body.trim();
-    const sep = trimmed.length > 0 && !trimmed.endsWith(";") ? ";" : "";
-    return `#${id} { ${body}${sep} ${decl} }`;
+    // Ensure transform-box: fill-box.
+    if (/transform-box\s*:/.test(updated)) {
+      updated = updated.replace(/transform-box\s*:[^;]+;?/, boxDecl);
+    } else {
+      updated = `${updated} ${boxDecl}`;
+    }
+    // Ensure transform-origin matches requested origin.
+    if (/transform-origin\s*:/.test(updated)) {
+      updated = updated.replace(/transform-origin\s*:[^;]+;?/, originDecl);
+    } else {
+      updated = `${updated} ${originDecl}`;
+    }
+    return `#${id} { ${updated} }`;
   });
   if (found) return next;
-  return `${next}\n#${id} { ${decl} }`;
+  return `${next}\n#${id} { ${boxDecl} ${originDecl} ${animDecl} }`;
 }
 
 export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promise<ToolResult> {
@@ -411,9 +467,7 @@ export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promi
   }
   try {
     assertNoScript(raw);
-    if (input.keyframes && /<script[\s>]/i.test(input.keyframes)) {
-      throw new Error("Rejected: <script> elements are not allowed.");
-    }
+    if (input.keyframes) assertNoScript(input.keyframes);
     const doc = loadXmlDoc(raw);
     ensurePicaSkeleton(doc);
     const styleEl = getElById(doc, "pica-anim");
@@ -427,7 +481,6 @@ export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promi
       const out = serializeDoc(doc);
       await atomicWriteFile(input.path, out);
       setCurrentSvg(input.path, out);
-      await notifyPreview(input.path).catch(() => undefined);
       return okText({ ok: true, path: input.path, removed: input.name });
     }
 
@@ -460,8 +513,9 @@ export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promi
       const iterStr = typeof iter === "number" ? String(iter) : iter;
       const dir = t.direction ?? "normal";
       const fill = t.fill ?? "both";
+      const origin = t.transformOrigin ?? "center";
       const value = `${input.name} ${dur}ms ${easing} ${delay}ms ${iterStr} ${dir} ${fill}`;
-      css = upsertIdRule(css, t.id, value);
+      css = upsertIdRule(css, t.id, value, origin);
       const iterNum = typeof iter === "number" ? iter : 1;
       const end = delay + dur * iterNum;
       if (end > maxEnd) maxEnd = end;
@@ -488,7 +542,6 @@ export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promi
     assertWellFormedXml(out);
     await atomicWriteFile(input.path, out);
     setCurrentSvg(input.path, out);
-    await notifyPreview(input.path).catch(() => undefined);
     return okText({ ok: true, path: input.path, name: input.name, targets: (input.animations ?? []).map((t) => t.id) });
   } catch (e) {
     return errText(`pica_animate failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -523,7 +576,8 @@ function buildDebugOverlay(width: number, height: number, nodes: Array<{ id: str
 export async function handleInspect(input: z.input<typeof InspectSchema>): Promise<ToolResult> {
   const showGrid = input.showGrid ?? false;
   const showIds = input.showIds ?? false;
-  const scale = input.scale ?? 1;
+  const requestedScale = input.scale ?? 1;
+  const maxWidth = input.maxWidth ?? 1024;
   const timeMs = input.timeMs ?? 0;
   let raw: string;
   try {
@@ -534,6 +588,11 @@ export async function handleInspect(input: z.input<typeof InspectSchema>): Promi
   try {
     const parsed = parsePica(stripDebugOverlay(raw));
     const clean = stripDebugOverlay(raw);
+    // Cap preview width so 4K canvases never flood agent context.
+    const effScale = Math.max(
+      0.05,
+      Math.min(requestedScale, maxWidth / Math.max(1, parsed.width)),
+    );
     let svgForRender = clean;
     if (showGrid || showIds) {
       const overlay = buildDebugOverlay(parsed.width, parsed.height, parsed.nodesFlat, showGrid, showIds);
@@ -541,17 +600,23 @@ export async function handleInspect(input: z.input<typeof InspectSchema>): Promi
     }
     let png: Buffer;
     let renderer = "resvg";
-    if (timeMs === 0) {
-      png = renderPngBuffer(svgForRender, scale);
-    } else {
-      if (!findChromeBinary()) {
-        return errText(`pica_inspect failed at timeMs=${timeMs}: ${chromeMissingMessage()}`);
-      }
-      png = await screenshotAtTime(svgForRender, parsed.width, parsed.height, timeMs, scale);
+    let note = "";
+    const animated = parsed.animations.length > 0;
+    if (timeMs === 0 && !animated) {
+      png = renderPngBuffer(svgForRender, effScale);
+    } else if (findChromeBinary()) {
+      png = await screenshotAtTime(svgForRender, parsed.width, parsed.height, timeMs, effScale);
       renderer = "chromium-cdp";
+    } else if (timeMs === 0) {
+      // No Chromium: fall back to a static resvg render; CSS keyframes
+      // (e.g. opacity:0 initial states) are not evaluated.
+      png = renderPngBuffer(svgForRender, effScale);
+      note = " (static fallback: CSS animations not evaluated, Chromium missing)";
+    } else {
+      return errText(`pica_inspect failed at timeMs=${timeMs}: ${chromeMissingMessage()}`);
     }
     const summary =
-      `Preview ${parsed.width}x${parsed.height} (scale ${scale}) at t=${timeMs}ms via ${renderer}. ` +
+      `Preview ${parsed.width}x${parsed.height} (scale ${effScale}) at t=${timeMs}ms via ${renderer}${note}. ` +
       `${parsed.nodesFlat.length} nodes, ${parsed.animations.length} keyframes. ` +
       `${showGrid ? "grid on. " : ""}${showIds ? "ids on." : ""}`.trim();
     return {

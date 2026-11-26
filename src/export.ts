@@ -1,3 +1,5 @@
+import { dirname } from "node:path";
+import { mkdir } from "node:fs/promises";
 import { atomicWriteFile, stripDebugOverlay } from "./pica-file.js";
 import { renderPngBuffer } from "./render.js";
 import { captureFrames } from "./chromium.js";
@@ -7,18 +9,44 @@ async function readSvgClean(path: string): Promise<string> {
   return stripDebugOverlay(raw);
 }
 
+async function ensureParentDir(outPath: string): Promise<void> {
+  const dir = dirname(outPath);
+  if (dir && dir !== "." && dir !== "") {
+    await mkdir(dir, { recursive: true });
+  }
+}
+
 function ffmpegQualityForJpg(quality: number): string {
   const q = Math.min(100, Math.max(0, quality));
   // map 100 -> 2 (best), 0 -> 31 (worst)
   return String(Math.round(31 - (q / 100) * 29));
 }
 
-async function runFfmpegWithPngInput(args: string[], png: Buffer): Promise<void> {
-  const proc = Bun.spawn(["ffmpeg", ...args], {
+function crfForQuality(quality: number): string {
+  const q = Math.min(100, Math.max(0, quality));
+  // map 100 -> 18 (high quality), 0 -> 51 (lowest)
+  return String(Math.round(51 - (q / 100) * 33));
+}
+
+async function drainStderr(proc: ReturnType<typeof Bun.spawn>): Promise<string> {
+  try {
+    const s = proc.stderr;
+    if (!s || typeof s === "number") return "";
+    return await new Response(s as ReadableStream).text();
+  } catch {
+    return "";
+  }
+}
+
+async function runFfmpegWithPngInput(args: string[], png: Buffer, outPath: string): Promise<void> {
+  await ensureParentDir(outPath);
+  const proc = Bun.spawn(["ffmpeg", "-loglevel", "error", ...args], {
     stdin: "pipe",
     stdout: "ignore",
     stderr: "pipe",
   });
+  // Drain stderr concurrently so a full pipe never blocks ffmpeg.
+  const stderrPromise = drainStderr(proc);
   try {
     const writer = proc.stdin;
     if (!writer || typeof writer === "number") {
@@ -33,16 +61,8 @@ async function runFfmpegWithPngInput(args: string[], png: Buffer): Promise<void>
     sink.flush();
     sink.end();
     const exit = await proc.exited;
+    const errText = await stderrPromise;
     if (exit !== 0) {
-      let errText = "";
-      try {
-        const s = proc.stderr;
-        if (s && typeof s !== "number") {
-          errText = await new Response(s as ReadableStream).text();
-        }
-      } catch {
-        // ignore
-      }
       throw new Error(`ffmpeg exited with code ${exit}: ${errText.slice(0, 500)}`);
     }
   } finally {
@@ -78,12 +98,14 @@ export async function exportStaticRaster(
     await runFfmpegWithPngInput(
       ["-y", "-f", "image2pipe", "-i", "-", "-q:v", ffmpegQualityForJpg(quality), outPath],
       png,
+      outPath,
     );
   } else {
     const q = Math.round(Math.min(100, Math.max(0, quality)));
     await runFfmpegWithPngInput(
       ["-y", "-f", "image2pipe", "-i", "-", "-quality", String(q), outPath],
       png,
+      outPath,
     );
   }
 }
@@ -99,10 +121,8 @@ export async function exportAnimated(
   scale: number,
   quality: number,
 ): Promise<void> {
-  const w = Math.max(1, Math.round(width * scale));
-  const h = Math.max(1, Math.round(height * scale));
-  void w;
-  void h;
+  await ensureParentDir(outPath);
+  const q = Math.round(Math.min(100, Math.max(0, quality)));
   const args =
     kind === "mp4"
       ? [
@@ -119,6 +139,10 @@ export async function exportAnimated(
           "libx264",
           "-pix_fmt",
           "yuv420p",
+          "-crf",
+          crfForQuality(q),
+          "-movflags",
+          "+faststart",
           "-r",
           String(fps),
           outPath,
@@ -134,24 +158,34 @@ export async function exportAnimated(
           "-c:v",
           "libwebp",
           "-quality",
-          String(Math.round(Math.min(100, Math.max(0, quality)))),
+          String(q),
           "-loop",
           "0",
           "-r",
           String(fps),
           outPath,
         ];
-  const proc = Bun.spawn(["ffmpeg", ...args], {
+  const proc = Bun.spawn(["ffmpeg", "-loglevel", "error", ...args], {
     stdin: "pipe",
     stdout: "ignore",
     stderr: "pipe",
   });
+  // Drain stderr concurrently while frames stream to stdin.
+  const stderrPromise = drainStderr(proc);
   const writer = proc.stdin as unknown as {
     write(c: Uint8Array): void | Promise<void>;
     flush(): void;
     end(): void;
   } | null;
-  if (!writer) throw new Error("Failed to open ffmpeg stdin pipe.");
+  if (!writer) {
+    try {
+      proc.kill();
+    } catch {
+      // ignore
+    }
+    await stderrPromise;
+    throw new Error("Failed to open ffmpeg stdin pipe.");
+  }
   try {
     await captureFrames(svgText, width, height, durationMs, fps, scale, async (png) => {
       await writer.write(png);
@@ -159,16 +193,8 @@ export async function exportAnimated(
     });
     writer.end();
     const exit = await proc.exited;
+    const errText = await stderrPromise;
     if (exit !== 0) {
-      let errText = "";
-      try {
-        const s = proc.stderr;
-        if (s && typeof s !== "number") {
-          errText = await new Response(s as ReadableStream).text();
-        }
-      } catch {
-        // ignore
-      }
       throw new Error(`ffmpeg exited with code ${exit}: ${errText.slice(0, 800)}`);
     }
   } catch (e) {
@@ -182,6 +208,7 @@ export async function exportAnimated(
     } catch {
       // ignore
     }
+    await stderrPromise;
     throw e;
   }
 }

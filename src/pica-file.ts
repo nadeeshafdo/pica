@@ -1,5 +1,5 @@
 import { DOMParser } from "linkedom";
-import { fastBbox } from "./bbox.js";
+import { fastBbox, unionBboxes } from "./bbox.js";
 
 export const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -138,7 +138,7 @@ export function assertWellFormedXml(xml: string): void {
 }
 
 export function assertNoScript(s: string): void {
-  if (/<script[\s>]/i.test(s)) {
+  if (/(<\s*\/?\s*svg\s*:\s*script\b|<\s*\/?\s*script\b)/i.test(s)) {
     throw new Error("Rejected: <script> elements are not allowed in .pica.svg files.");
   }
 }
@@ -234,17 +234,12 @@ export function parseAnimationsList(cssText: string): PicaAnimations[] {
 }
 
 export function extractKeyframesBody(css: string, name: string): string {
-  const idx = css.indexOf(`@keyframes ${name}`);
-  const altIdx = css.indexOf(`@keyframes  ${name}`);
-  let start = idx >= 0 ? idx : altIdx;
-  if (start < 0) {
-    // fallback regex search
-    const re = new RegExp(`@keyframes\\s+${escapeRegExp(name)}\\s*\\{`, "g");
-    const mm = re.exec(css);
-    if (!mm || mm.index === undefined) return "";
-    start = mm.index;
-  }
-  const brace = css.indexOf("{", start);
+  // Always match via regex so "@keyframes fadeUp" before "@keyframes fade"
+  // never shadows the shorter name via prefix search.
+  const re = new RegExp(`@keyframes\\s+${escapeRegExp(name)}\\s*\\{`, "g");
+  const mm = re.exec(css);
+  if (!mm || mm.index === undefined) return "";
+  const brace = css.indexOf("{", mm.index);
   if (brace < 0) return "";
   let depth = 0;
   for (let i = brace; i < css.length; i++) {
@@ -258,15 +253,21 @@ export function extractKeyframesBody(css: string, name: string): string {
   return "";
 }
 
+function animationNameTokenRe(name: string): RegExp {
+  return new RegExp(`(?<![A-Za-z0-9_-])${escapeRegExp(name)}(?![A-Za-z0-9_-])`);
+}
+
 function findAnimationTargets(css: string, name: string): string[] {
   const targets: string[] = [];
-  // Match "#id { ... animation ... name ... }" blocks
+  // Match "#id { ... }" blocks and test the animation name as an exact token
+  // so removing "fade" never matches "fadeUp".
+  const re = animationNameTokenRe(name);
   const ruleRe = /#([A-Za-z0-9_-]+)\s*\{([^}]*)\}/g;
   let m: RegExpExecArray | null;
   while ((m = ruleRe.exec(css)) !== null) {
     const id = m[1] as string;
     const body = m[2] as string;
-    if (body.includes(name)) targets.push(id);
+    if (re.test(body)) targets.push(id);
   }
   return targets;
 }
@@ -275,24 +276,39 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function nodeFromElement(el: Element): PicaNode {
-  const tag = (el.tagName ?? "unknown").toLowerCase();
-  const attrs = attrsOf(el);
-  const id = attrs["id"] ?? "";
-  const text = el.childNodes.length === 1 && el.firstChild?.nodeType === 3 ? (el.textContent ?? "") : (tag === "text" ? (el.textContent ?? "") : "");
-  const bbox = fastBbox(tag, attrs, text);
-  return { id, tag, attrs, bbox };
+const CONTAINER_TAGS = new Set(["g", "a", "symbol", "svg"]);
+
+function textOfElement(el: Element, tag: string): string {
+  if (el.childNodes.length === 1 && el.firstChild?.nodeType === 3) return el.textContent ?? "";
+  if (tag === "text") return el.textContent ?? "";
+  return "";
 }
 
 function treeFromElement(el: Element): PicaNodeTree {
-  const base = nodeFromElement(el);
+  const tag = (el.tagName ?? "unknown").toLowerCase();
+  const attrs = attrsOf(el);
+  const id = attrs["id"] ?? "";
   const children: PicaNodeTree[] = [];
   for (let i = 0; i < el.children.length; i++) {
     const c = el.children[i] as Element | undefined;
     if (!c) continue;
     children.push(treeFromElement(c));
   }
-  return { ...base, children };
+  const bbox = CONTAINER_TAGS.has(tag)
+    ? unionBboxes(children.map((c) => c.bbox))
+    : fastBbox(tag, attrs, textOfElement(el, tag));
+  return { id, tag, attrs, bbox, children };
+}
+
+function flattenTree(trees: PicaNodeTree[]): PicaNode[] {
+  const out: PicaNode[] = [];
+  const walk = (t: PicaNodeTree): void => {
+    const { children: _c, ...rest } = t;
+    out.push(rest);
+    for (const c of t.children) walk(c);
+  };
+  for (const t of trees) walk(t);
+  return out;
 }
 
 export function parsePica(svgText: string): ParsedPica {
@@ -303,21 +319,15 @@ export function parsePica(svgText: string): ParsedPica {
   const cssText = (styleEl?.textContent ?? "").trim();
   const animations = parseAnimationsList(cssText);
   const root = getElById(doc, "pica-root");
-  const nodesFlat: PicaNode[] = [];
   const nodesTree: PicaNodeTree[] = [];
   if (root) {
-    const all = root.querySelectorAll("*");
-    for (let i = 0; i < all.length; i++) {
-      const el = all[i] as unknown as Element | undefined;
-      if (!el) continue;
-      nodesFlat.push(nodeFromElement(el));
-    }
     for (let i = 0; i < root.children.length; i++) {
       const c = root.children[i] as Element | undefined;
       if (!c) continue;
       nodesTree.push(treeFromElement(c));
     }
   }
+  const nodesFlat: PicaNode[] = flattenTree(nodesTree);
   return { width, height, meta, cssText, animations, nodesFlat, nodesTree, raw: svgText };
 }
 

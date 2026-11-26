@@ -99,6 +99,8 @@
   let durationMs = 2000;
   let playing = true;
   let currentPath = '';
+  let lastW = 0, lastH = 0;
+  let fittedOnce = false;
 
   function applyTransform() {
     artboard.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
@@ -171,33 +173,75 @@
     }
   }, 100);
 
+  function parseSvgDims(svg) {
+    const wAttr = svg.getAttribute && svg.getAttribute('width');
+    const hAttr = svg.getAttribute && svg.getAttribute('height');
+    let w = wAttr ? parseFloat(wAttr) : NaN;
+    let h = hAttr ? parseFloat(hAttr) : NaN;
+    if ((!isFinite(w) || !isFinite(h)) && svg.getAttribute) {
+      const vb = svg.getAttribute('viewBox');
+      if (vb) {
+        const parts = vb.trim().split(/[\s,]+/).map(Number);
+        if (parts.length === 4 && parts.every(isFinite)) {
+          if (!isFinite(w)) w = parts[2];
+          if (!isFinite(h)) h = parts[3];
+        }
+      }
+    }
+    return { w: isFinite(w) ? w : 800, h: isFinite(h) ? h : 600 };
+  }
+
+  function extractSvg(text) {
+    try {
+      const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+      if (doc.querySelector('parsererror')) return null;
+      const svg = doc.querySelector('svg');
+      if (svg) return { svg, owned: true, doc };
+    } catch (e) { /* fall through to innerHTML */ }
+    const tmp = document.createElement('div');
+    tmp.innerHTML = text;
+    const svg = tmp.querySelector('svg');
+    return svg ? { svg, owned: false } : null;
+  }
+
   async function load() {
     try {
       statusEl.textContent = 'loading';
       const res = await fetch('/svg', { cache: 'no-store' });
       if (!res.ok) { statusEl.textContent = 'no file yet'; return; }
       const text = await res.text();
-      currentPath = res.headers.get('x-pica-path') || currentPath;
+      const nextPath = res.headers.get('x-pica-path') || currentPath;
+      const parsed = extractSvg(text);
+      if (!parsed || !parsed.svg) { statusEl.textContent = 'parse failed'; return; }
+      currentPath = nextPath;
       filepathEl.textContent = currentPath || 'live svg';
-      const tmp = document.createElement('div');
-      tmp.innerHTML = text;
-      const svg = tmp.querySelector('svg');
+      const dims = parseSvgDims(parsed.svg);
+      const pathChanged = parsed.svg && nextPath !== filepathEl.dataset.path;
+      const dimsChanged = dims.w !== lastW || dims.h !== lastH;
+      filepathEl.dataset.path = nextPath || '';
+      // Adopt the parsed node into the live document.
+      const svg = parsed.owned ? document.importNode(parsed.svg, true) : parsed.svg;
       artboard.innerHTML = '';
-      if (svg) {
-        artboard.appendChild(svg);
-        try {
-          const meta = svg.querySelector('#pica-meta');
-          if (meta && meta.textContent) {
-            const j = JSON.parse(meta.textContent.trim());
-            if (typeof j.durationMs === 'number') {
-              durationMs = j.durationMs;
-              scrub.max = String(durationMs);
-              timelabel.textContent = `0 / ${durationMs} ms`;
-            }
+      artboard.appendChild(svg);
+      try {
+        const meta = svg.querySelector('#pica-meta');
+        if (meta && meta.textContent) {
+          const j = JSON.parse(meta.textContent.trim());
+          if (typeof j.durationMs === 'number') {
+            durationMs = j.durationMs;
+            scrub.max = String(durationMs);
+            timelabel.textContent = `0 / ${durationMs} ms`;
           }
-        } catch (e) {}
-        playing = true;
-        playpause.textContent = 'Pause';
+        }
+      } catch (e) {}
+      playing = true;
+      playpause.textContent = 'Pause';
+      // Only reset the camera on first load, path switch, or canvas resize.
+      // Live patches preserve the user's zoom/pan.
+      if (!fittedOnce || pathChanged || dimsChanged) {
+        lastW = dims.w;
+        lastH = dims.h;
+        fittedOnce = true;
         fit();
       }
       statusEl.textContent = '';

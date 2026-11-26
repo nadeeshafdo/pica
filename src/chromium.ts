@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { rmSync } from "node:fs";
 import type { Bbox } from "./pica-file.js";
 
 const CHROME_CANDIDATES = ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"];
@@ -33,6 +34,7 @@ export function chromeMissingMessage(): string {
 interface Pending {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 class CdpConn {
@@ -61,6 +63,7 @@ class CdpConn {
         const p = this.pending.get(msg.id);
         if (!p) return;
         this.pending.delete(msg.id);
+        clearTimeout(p.timer);
         if (msg.error) {
           p.reject(new Error(`CDP error: ${msg.error.message ?? "unknown"}`));
         } else {
@@ -71,7 +74,7 @@ class CdpConn {
       if (msg.method) {
         const arr = this.listeners.get(msg.method);
         if (arr) {
-          for (const fn of arr) {
+          for (const fn of [...arr]) {
             try {
               fn(msg.params);
             } catch {
@@ -84,6 +87,7 @@ class CdpConn {
     this.ws.onclose = () => {
       this.closed = true;
       for (const [, p] of this.pending) {
+        clearTimeout(p.timer);
         p.reject(new Error("CDP connection closed."));
       }
       this.pending.clear();
@@ -115,24 +119,44 @@ class CdpConn {
     this.listeners.set(method, arr);
   }
 
+  off(method: string, fn: (params: unknown) => void): void {
+    const arr = this.listeners.get(method);
+    if (!arr) return;
+    const i = arr.indexOf(fn);
+    if (i >= 0) arr.splice(i, 1);
+    if (arr.length === 0) this.listeners.delete(method);
+  }
+
+  once(method: string, fn: (params: unknown) => void): void {
+    const wrap = (p: unknown) => {
+      this.off(method, wrap);
+      fn(p);
+    };
+    this.on(method, wrap);
+  }
+
   send(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<unknown> {
     const id = this.nextId++;
     const payload: Record<string, unknown> = { id, method, params };
     if (sessionId) payload["sessionId"] = sessionId;
     return new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      try {
-        this.ws.send(JSON.stringify(payload));
-      } catch (e) {
-        this.pending.delete(id);
-        reject(e instanceof Error ? e : new Error(String(e)));
-      }
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
           reject(new Error(`CDP timeout waiting for ${method}.`));
         }
       }, 20000);
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        this.ws.send(JSON.stringify(payload));
+      } catch (e) {
+        const p = this.pending.get(id);
+        if (p) {
+          this.pending.delete(id);
+          clearTimeout(p.timer);
+        }
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
     });
   }
 
@@ -149,9 +173,34 @@ let browserProc: ReturnType<typeof Bun.spawn> | null = null;
 let browserConn: CdpConn | null = null;
 let pageSessionId: string | null = null;
 let pageTargetId: string | null = null;
+let browserUserDir: string | null = null;
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
 let starting: Promise<void> | null = null;
 let sigHooked = false;
+
+// Serialize all CDP page work so concurrent tool calls (e.g.
+// Promise.all([inspect(t=100), inspect(t=400)])) never race on the
+// shared pageSessionId.
+let cdpQueue: Promise<void> = Promise.resolve();
+
+function withCdpLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = cdpQueue.then(fn, fn);
+  // Keep the chain alive even if this unit rejects.
+  cdpQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+function removeUserDirSync(dir: string | null): void {
+  if (!dir) return;
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+}
 
 function hookSignals(): void {
   if (sigHooked) return;
@@ -172,6 +221,8 @@ function hookSignals(): void {
     } catch {
       // ignore
     }
+    removeUserDirSync(browserUserDir);
+    browserUserDir = null;
   };
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
@@ -210,6 +261,15 @@ export async function closeBrowser(): Promise<void> {
     }
     browserProc = null;
   }
+  if (browserUserDir) {
+    const dir = browserUserDir;
+    browserUserDir = null;
+    try {
+      await rm(dir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  }
 }
 
 async function readBrowserEndpoint(proc: ReturnType<typeof Bun.spawn>): Promise<string> {
@@ -247,9 +307,13 @@ async function readBrowserEndpoint(proc: ReturnType<typeof Bun.spawn>): Promise<
 }
 
 async function startBrowser(): Promise<void> {
-  if (browserConn && pageSessionId) {
+  if (browserConn && !browserConn.closed && pageSessionId) {
     touchIdle();
     return;
+  }
+  // Stale connection (crashed socket): clean up before relaunch.
+  if (browserConn?.closed) {
+    await closeBrowser().catch(() => undefined);
   }
   if (starting) {
     await starting;
@@ -259,6 +323,7 @@ async function startBrowser(): Promise<void> {
     const bin = findChromeBinary();
     if (!bin) throw new Error(chromeMissingMessage());
     const userDir = await mkdtemp(join(tmpdir(), "pica-chrome-"));
+    browserUserDir = userDir;
     const args = [
       "--headless",
       "--no-sandbox",
@@ -275,22 +340,27 @@ async function startBrowser(): Promise<void> {
       stderr: "pipe",
       stdin: "ignore",
     });
-    const endpoint = await readBrowserEndpoint(browserProc);
-    browserConn = await CdpConn.connect(endpoint);
-    const created = (await browserConn.send("Target.createTarget", { url: "about:blank" })) as {
-      targetId?: string;
-    };
-    if (!created?.targetId) throw new Error("Chromium Target.createTarget did not return a targetId.");
-    pageTargetId = created.targetId;
-    const attached = (await browserConn.send("Target.attachToTarget", {
-      targetId: pageTargetId,
-      flatten: true,
-    })) as { sessionId?: string };
-    if (!attached?.sessionId) throw new Error("Chromium Target.attachToTarget did not return a sessionId.");
-    pageSessionId = attached.sessionId;
-    await browserConn.send("Page.enable", {}, pageSessionId);
-    await browserConn.send("Runtime.enable", {}, pageSessionId);
-    touchIdle();
+    try {
+      const endpoint = await readBrowserEndpoint(browserProc);
+      browserConn = await CdpConn.connect(endpoint);
+      const created = (await browserConn.send("Target.createTarget", { url: "about:blank" })) as {
+        targetId?: string;
+      };
+      if (!created?.targetId) throw new Error("Chromium Target.createTarget did not return a targetId.");
+      pageTargetId = created.targetId;
+      const attached = (await browserConn.send("Target.attachToTarget", {
+        targetId: pageTargetId,
+        flatten: true,
+      })) as { sessionId?: string };
+      if (!attached?.sessionId) throw new Error("Chromium Target.attachToTarget did not return a sessionId.");
+      pageSessionId = attached.sessionId;
+      await browserConn.send("Page.enable", {}, pageSessionId);
+      await browserConn.send("Runtime.enable", {}, pageSessionId);
+      touchIdle();
+    } catch (e) {
+      await closeBrowser().catch(() => undefined);
+      throw e;
+    }
   })();
   try {
     await starting;
@@ -307,26 +377,40 @@ export async function ensureBrowser(): Promise<void> {
 function htmlWrapper(svgText: string, w: number, h: number): string {
   return (
     `<!doctype html><html><head><meta charset="utf-8"><style>` +
-    `html,body{margin:0;padding:0;background:#fff}svg{display:block;width:${w}px;height:${h}px}` +
+    `html,body{margin:0;padding:0;background:transparent}svg{display:block;width:${w}px;height:${h}px}` +
     `</style></head><body>${svgText}</body></html>`
   );
 }
 
-async function navigateToHtml(html: string): Promise<void> {
+async function applyViewport(w: number, h: number, session: string): Promise<void> {
+  if (!browserConn) throw new Error("Browser not started.");
+  await browserConn.send(
+    "Emulation.setDeviceMetricsOverride",
+    { width: w, height: h, deviceScaleFactor: 1, mobile: false },
+    session,
+  );
+  // Transparent default so SVGs without an opaque background keep alpha.
+  try {
+    await browserConn.send(
+      "Emulation.setDefaultBackgroundColorOverride",
+      { color: { r: 0, g: 0, b: 0, a: 0 } },
+      session,
+    );
+  } catch {
+    // Older builds may not support this; capture proceeds with default.
+  }
+}
+
+async function setDocumentHtml(html: string): Promise<void> {
   if (!browserConn || !pageSessionId) throw new Error("Browser not started.");
   const conn = browserConn;
   const session = pageSessionId;
-  const loaded = new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Timed out waiting for page load.")), 15000);
-    const handler = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    conn.on("Page.loadEventFired", handler as (p: unknown) => void);
-  });
-  const url = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
-  await conn.send("Page.navigate", { url }, session);
-  await loaded;
+  const tree = (await conn.send("Page.getFrameTree", {}, session)) as {
+    frameTree?: { frame?: { id?: string } };
+  };
+  const frameId = tree?.frameTree?.frame?.id;
+  if (!frameId) throw new Error("Chromium Page.getFrameTree did not return a frame id.");
+  await conn.send("Page.setDocumentContent", { frameId, html }, session);
 }
 
 async function runtimeEval<T>(expression: string, awaitPromise = false): Promise<T> {
@@ -353,15 +437,12 @@ export async function getExactBboxes(
   width: number,
   height: number,
 ): Promise<Array<{ id: string; bbox: Bbox }>> {
-  await ensureBrowser();
-  if (!browserConn || !pageSessionId) throw new Error("Browser not started.");
-  const { w, h } = scaledSize(width, height, 1);
-  await browserConn.send(
-    "Emulation.setDeviceMetricsOverride",
-    { width: w, height: h, deviceScaleFactor: 1, mobile: false },
-    pageSessionId,
-  );
-  await navigateToHtml(htmlWrapper(svgText, w, h));
+  return withCdpLock(async () => {
+    await ensureBrowser();
+    if (!browserConn || !pageSessionId) throw new Error("Browser not started.");
+    const { w, h } = scaledSize(width, height, 1);
+    await applyViewport(w, h, pageSessionId);
+    await setDocumentHtml(htmlWrapper(svgText, w, h));
   const out = await runtimeEval<Array<{ id: string; bbox: Bbox }>>(
     `(() => {
       const els = Array.from(document.querySelectorAll('[id]'));
@@ -376,8 +457,9 @@ export async function getExactBboxes(
       });
     })()`,
   );
-  touchIdle();
-  return Array.isArray(out) ? out : [];
+    touchIdle();
+    return Array.isArray(out) ? out : [];
+  });
 }
 
 export async function screenshotAtTime(
@@ -387,30 +469,28 @@ export async function screenshotAtTime(
   timeMs: number,
   scale: number,
 ): Promise<Buffer> {
-  await ensureBrowser();
-  if (!browserConn || !pageSessionId) throw new Error("Browser not started.");
-  const { w, h } = scaledSize(width, height, scale);
-  await browserConn.send(
-    "Emulation.setDeviceMetricsOverride",
-    { width: w, height: h, deviceScaleFactor: 1, mobile: false },
-    pageSessionId,
-  );
-  await navigateToHtml(htmlWrapper(svgText, w, h));
-  await runtimeEval(
-    `(async () => {
-      document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${Math.max(0, timeMs)}; } catch (e) {} });
-      await new Promise((r) => requestAnimationFrame(() => r(1)));
-      document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${Math.max(0, timeMs)}; } catch (e) {} });
-      return 'ok';
-    })()`,
-    true,
-  );
-  const res = (await browserConn.send("Page.captureScreenshot", { format: "png", fromSurface: true }, pageSessionId)) as {
-    data?: string;
-  };
-  touchIdle();
-  if (!res?.data) throw new Error("Chromium Page.captureScreenshot returned no data.");
-  return Buffer.from(res.data, "base64");
+  return withCdpLock(async () => {
+    await ensureBrowser();
+    if (!browserConn || !pageSessionId) throw new Error("Browser not started.");
+    const { w, h } = scaledSize(width, height, scale);
+    await applyViewport(w, h, pageSessionId);
+    await setDocumentHtml(htmlWrapper(svgText, w, h));
+    await runtimeEval(
+      `(async () => {
+        document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${Math.max(0, timeMs)}; } catch (e) {} });
+        await new Promise((r) => requestAnimationFrame(() => r(1)));
+        document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${Math.max(0, timeMs)}; } catch (e) {} });
+        return 'ok';
+      })()`,
+      true,
+    );
+    const res = (await browserConn.send("Page.captureScreenshot", { format: "png", fromSurface: true }, pageSessionId)) as {
+      data?: string;
+    };
+    touchIdle();
+    if (!res?.data) throw new Error("Chromium Page.captureScreenshot returned no data.");
+    return Buffer.from(res.data, "base64");
+  });
 }
 
 export async function captureFrames(
@@ -422,36 +502,34 @@ export async function captureFrames(
   scale: number,
   onFrame: (png: Buffer) => Promise<void> | void,
 ): Promise<void> {
-  await ensureBrowser();
-  if (!browserConn || !pageSessionId) throw new Error("Browser not started.");
-  const { w, h } = scaledSize(width, height, scale);
-  await browserConn.send(
-    "Emulation.setDeviceMetricsOverride",
-    { width: w, height: h, deviceScaleFactor: 1, mobile: false },
-    pageSessionId,
-  );
-  await navigateToHtml(htmlWrapper(svgText, w, h));
-  const step = 1000 / Math.max(1, fps);
-  const times: number[] = [];
-  for (let t = 0; t < durationMs; t += step) times.push(Math.round(t));
-  if (times.length === 0) times.push(0);
-  for (const t of times) {
-    await runtimeEval(
-      `(async () => {
-        document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${t}; } catch (e) {} });
-        await new Promise((r) => requestAnimationFrame(() => r(1)));
-        return 'ok';
-      })()`,
-      true,
-    );
-    const res = (await browserConn.send(
-      "Page.captureScreenshot",
-      { format: "png", fromSurface: true },
-      pageSessionId as string,
-    )) as { data?: string };
-    if (!res?.data) throw new Error("Chromium Page.captureScreenshot returned no data.");
-    await onFrame(Buffer.from(res.data, "base64"));
+  return withCdpLock(async () => {
+    await ensureBrowser();
+    if (!browserConn || !pageSessionId) throw new Error("Browser not started.");
+    const { w, h } = scaledSize(width, height, scale);
+    await applyViewport(w, h, pageSessionId);
+    await setDocumentHtml(htmlWrapper(svgText, w, h));
+    // Integer frame loop: exact count, no floating-point drift.
+    const safeFps = Math.max(1, fps);
+    const totalFrames = Math.max(1, Math.round((durationMs / 1000) * safeFps));
+    for (let i = 0; i < totalFrames; i++) {
+      const t = Math.round((i * 1000) / safeFps);
+      await runtimeEval(
+        `(async () => {
+          document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${t}; } catch (e) {} });
+          await new Promise((r) => requestAnimationFrame(() => r(1)));
+          return 'ok';
+        })()`,
+        true,
+      );
+      const res = (await browserConn.send(
+        "Page.captureScreenshot",
+        { format: "png", fromSurface: true },
+        pageSessionId as string,
+      )) as { data?: string };
+      if (!res?.data) throw new Error("Chromium Page.captureScreenshot returned no data.");
+      await onFrame(Buffer.from(res.data, "base64"));
+      touchIdle();
+    }
     touchIdle();
-  }
-  touchIdle();
+  });
 }
