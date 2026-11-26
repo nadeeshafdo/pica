@@ -2,6 +2,7 @@
   "name": "pica-mcp",
   "version": "0.1.0",
   "description": "Ultra-lightweight headless-first 2D vector design and animation MCP server",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "pica": "./src/index.ts"
