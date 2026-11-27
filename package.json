@@ -3,15 +3,52 @@
   "version": "0.1.0",
   "description": "Ultra-lightweight headless-first 2D vector design and animation MCP server",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "author": "Nadeesha Fernando <itsme@nadeeshafdo.dev>",
+  "homepage": "https://github.com/nadeeshafdo/pica#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nadeeshafdo/pica.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nadeeshafdo/pica/issues"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "svg",
+    "vector",
+    "animation",
+    "ai-agents",
+    "headless",
+    "bun",
+    "resvg",
+    "ffmpeg"
+  ],
   "type": "module",
   "bin": {
-    "pica": "./src/index.ts"
+    "pica": "./dist/index.js",
+    "pica-mcp": "./dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md"
+  ],
   "scripts": {
     "start": "bun src/index.ts",
     "typecheck": "bunx tsc --noEmit",
     "test": "bun test",
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun"
+    "build": "rm -rf dist && bun build ./src/index.ts --outdir ./dist --target bun --packages=external && cp src/viewer.html dist/viewer.html",
+    "prepare": "bun run build",
+    "prepublishOnly": "bun run typecheck && bun test && bun run build"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.4.0",

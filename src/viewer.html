@@ -196,12 +196,11 @@
       const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
       if (doc.querySelector('parsererror')) return null;
       const svg = doc.querySelector('svg');
-      if (svg) return { svg, owned: true, doc };
-    } catch (e) { /* fall through to innerHTML */ }
-    const tmp = document.createElement('div');
-    tmp.innerHTML = text;
-    const svg = tmp.querySelector('svg');
-    return svg ? { svg, owned: false } : null;
+      if (!svg) return null;
+      return { svg, owned: true, doc };
+    } catch (e) {
+      return null;
+    }
   }
 
   async function load() {

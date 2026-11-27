@@ -1,23 +1,44 @@
 import { z } from "zod";
 import {
-  atomicWriteFile,
   assertNoScript,
+  assertSafeAttributesRecord,
+  assertSafeDefsSvg,
+  assertSafeSvgTree,
   assertWellFormedXml,
+  atomicWriteFile,
   buildPicaSvg,
   ensurePicaSkeleton,
   getElById,
+  isForbiddenTag,
   loadXmlDoc,
+  localAttrName,
   parseAnimationsList,
   parseDims,
   parseMeta,
   parsePica,
+  resolveSafePath,
   serializeDoc,
   stripDebugOverlay,
   type Bbox,
 } from "./pica-file.js";
 import { renderPngBuffer } from "./render.js";
-import { captureFrames, chromeMissingMessage, findChromeBinary, getExactBboxes, screenshotAtTime } from "./chromium.js";
-import { exportAnimated, exportPng, exportStaticRaster, exportSvgClean } from "./export.js";
+import {
+  captureFrames,
+  chromeMissingMessage,
+  findChromeBinary,
+  getExactBboxes,
+  getRenderedBboxesAtTime,
+  screenshotAtTime,
+} from "./chromium.js";
+import {
+  assertSafeFfmpegOutPath,
+  exportAnimated,
+  exportPng,
+  exportPngAtTime,
+  exportStaticRaster,
+  exportStaticRasterAtTime,
+  exportSvgClean,
+} from "./export.js";
 import { setCurrentSvg } from "./preview.js";
 
 // ---------- Zod schemas ----------
@@ -121,6 +142,7 @@ export const ExportSchema = z.object({
   quality: z.number().min(0).max(100).default(90).describe("Quality for jpg/webp/mp4 (0-100)"),
   fps: z.number().positive().max(120).optional().describe("FPS for animated export (defaults to file meta)"),
   animated: z.boolean().default(false).describe("For webp: true = animated via Chromium, false = static frame"),
+  timeMs: z.number().min(0).default(0).describe("Static frame timestamp in ms. When > 0 requires Chromium; animated docs use Chromium at timeMs for accurate state."),
 });
 export type ExportInput = z.infer<typeof ExportSchema>;
 
@@ -148,6 +170,7 @@ function errText(message: string): ToolResult {
 
 export async function handleCreate(input: z.input<typeof CreateSchema>): Promise<ToolResult> {
   try {
+    const safePath = resolveSafePath(input.path);
     const width = input.width ?? 800;
     const height = input.height ?? 600;
     const background = input.background ?? "#ffffff";
@@ -161,11 +184,11 @@ export async function handleCreate(input: z.input<typeof CreateSchema>): Promise
       durationMs,
     });
     assertNoScript(svg);
-    await atomicWriteFile(input.path, svg);
-    setCurrentSvg(input.path, svg);
+    await atomicWriteFile(safePath, svg);
+    setCurrentSvg(safePath, svg);
     return okText({
       ok: true,
-      path: input.path,
+      path: safePath,
       width,
       height,
       background,
@@ -178,15 +201,21 @@ export async function handleCreate(input: z.input<typeof CreateSchema>): Promise
 }
 
 export async function handleRead(input: z.input<typeof ReadSchema>): Promise<ToolResult> {
+  let safePath: string;
+  try {
+    safePath = resolveSafePath(input.path);
+  } catch (e) {
+    return errText(`pica_read failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
   try {
     const includeRaw = input.includeRaw ?? false;
     const bboxMode = input.bboxMode ?? "fast";
     const tree = input.tree ?? false;
     let raw: string;
     try {
-      raw = await Bun.file(input.path).text();
+      raw = await Bun.file(safePath).text();
     } catch {
-      return errText(`pica_read failed: file not found: ${input.path}. Create it first with pica_create.`);
+      return errText(`pica_read failed: file not found: ${safePath}. Create it first with pica_create.`);
     }
     const parsed = parsePica(raw);
     let nodes = parsed.nodesFlat;
@@ -206,7 +235,7 @@ export async function handleRead(input: z.input<typeof ReadSchema>): Promise<Too
       }
     }
     const out: Record<string, unknown> = {
-      path: input.path,
+      path: safePath,
       width: parsed.width,
       height: parsed.height,
       meta: parsed.meta,
@@ -224,50 +253,58 @@ export async function handleRead(input: z.input<typeof ReadSchema>): Promise<Too
 }
 
 const PROTECTED_IDS = new Set(["pica-meta", "pica-defs", "pica-anim", "pica-bg", "pica-root"]);
+const UPDATE_PROTECTED_IDS = new Set(["pica-meta", "pica-defs", "pica-anim", "pica-root"]);
+const SAFE_BG_ATTRS = new Set(["fill", "opacity", "fill-opacity"]);
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 const ID_RE = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
 
 function sanitizeTag(tag: string): void {
-  if (/^script$/i.test(tag)) throw new Error("Rejected: <script> elements are not allowed.");
+  const local = tag.includes(":") ? (tag.split(":").pop() ?? tag).toLowerCase() : tag.toLowerCase();
+  if (isForbiddenTag(tag) || local === "script") {
+    throw new Error(`Rejected: <${tag}> elements are not allowed.`);
+  }
   if (!/^[A-Za-z][\w-]*$/.test(tag)) throw new Error(`Invalid tag name: ${tag}.`);
+  if (/^script$/i.test(tag)) throw new Error("Rejected: <script> elements are not allowed.");
 }
 
 function sanitizeAttrs(attrs: Record<string, string | number | null> | undefined): Record<string, string | null> {
   const out: Record<string, string | null> = {};
   if (!attrs) return out;
+  const record: Record<string, string | null> = {};
   for (const [k, v] of Object.entries(attrs)) {
-    if (/^on/i.test(k)) throw new Error(`Rejected: event-handler attribute '${k}' is not allowed.`);
     if (v === null) {
-      out[k] = null;
+      record[k] = null;
       continue;
     }
-    const val = String(v);
-    if (/javascript\s*:/i.test(val)) throw new Error(`Rejected: javascript: URL in attribute '${k}'.`);
-    out[k] = val;
+    record[k] = String(v);
   }
-  if (Object.keys(out).some((k) => /^script$/i.test(k))) {
-    throw new Error("Rejected: <script> is not allowed.");
+  assertSafeAttributesRecord(record);
+  for (const [k, v] of Object.entries(record)) {
+    out[k] = v;
+  }
+  if (Object.keys(out).some((k) => isForbiddenTag(k))) {
+    throw new Error("Rejected: forbidden tag name in attributes.");
   }
   return out;
 }
 
 function sanitizeDefsSvg(defsSvg: string): void {
-  assertNoScript(defsSvg);
-  if (/\son\w+\s*=/i.test(defsSvg)) {
-    throw new Error("Rejected: event-handler attributes (on*) are not allowed in defs.");
-  }
-  if (/javascript\s*:/i.test(defsSvg)) {
-    throw new Error("Rejected: javascript: URLs are not allowed in defs.");
-  }
+  assertSafeDefsSvg(defsSvg);
 }
 
 export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<ToolResult> {
+  let safePath: string;
+  try {
+    safePath = resolveSafePath(input.path);
+  } catch (e) {
+    return errText(`pica_patch failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
   let raw: string;
   try {
-    raw = await Bun.file(input.path).text();
+    raw = await Bun.file(safePath).text();
   } catch {
-    return errText(`pica_patch failed: file not found: ${input.path}. Create it first with pica_create.`);
+    return errText(`pica_patch failed: file not found: ${safePath}. Create it first with pica_create.`);
   }
   try {
     assertNoScript(raw);
@@ -282,6 +319,9 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
             `pica_patch add failed: invalid id '#${op.id}'. Use /^[a-zA-Z_][a-zA-Z0-9_-]*$/.`,
           );
         }
+        if (isForbiddenTag(op.id)) {
+          throw new Error(`pica_patch add failed: id '#${op.id}' is forbidden.`);
+        }
         const attrs = sanitizeAttrs(op.attrs);
         if (op.textContent) assertNoScript(op.textContent);
         if (getElById(doc, op.id)) throw new Error(`pica_patch add failed: id '#${op.id}' already exists.`);
@@ -292,6 +332,9 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
         for (const [k, v] of Object.entries(attrs)) {
           if (v === null) {
             throw new Error(`pica_patch add failed: attribute '${k}' cannot be null on add.`);
+          }
+          if (localAttrName(k).startsWith("on")) {
+            throw new Error(`pica_patch add failed: event-handler attribute '${k}' is not allowed.`);
           }
           el.setAttribute(k, v);
         }
@@ -309,16 +352,43 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
           parent.appendChild(el);
         }
       } else if (op.op === "update") {
+        if (UPDATE_PROTECTED_IDS.has(op.id)) {
+          throw new Error(`pica_patch update failed: '#${op.id}' is protected and cannot be updated.`);
+        }
         const el = getElById(doc, op.id);
         if (!el) throw new Error(`pica_patch update failed: target '#${op.id}' not found.`);
-        const attrs = sanitizeAttrs(op.attrs);
-        for (const [k, v] of Object.entries(attrs)) {
-          if (v === null) el.removeAttribute(k);
-          else el.setAttribute(k, v);
-        }
-        if (op.textContent !== undefined) {
-          assertNoScript(op.textContent);
-          el.textContent = op.textContent;
+        if (op.id === "pica-bg") {
+          if (op.textContent !== undefined) {
+            throw new Error("pica_patch update failed: '#pica-bg' cannot have textContent.");
+          }
+          const attrs = sanitizeAttrs(op.attrs);
+          for (const [k, v] of Object.entries(attrs)) {
+            if (localAttrName(k) === "id" || k.toLowerCase() === "id") {
+              throw new Error("pica_patch update failed: '#pica-bg' id cannot be changed.");
+            }
+            if (!SAFE_BG_ATTRS.has(localAttrName(k))) {
+              throw new Error(`pica_patch update failed: attribute '${k}' is not allowed on '#pica-bg'. Allowed: fill, opacity, fill-opacity.`);
+            }
+          }
+          for (const [k, v] of Object.entries(attrs)) {
+            if (v === null) el.removeAttribute(k);
+            else el.setAttribute(k, v);
+          }
+        } else {
+          const attrs = sanitizeAttrs(op.attrs);
+          for (const [k] of Object.entries(attrs)) {
+            if (localAttrName(k) === "id") {
+              throw new Error("pica_patch update failed: id attribute cannot be changed or removed.");
+            }
+          }
+          for (const [k, v] of Object.entries(attrs)) {
+            if (v === null) el.removeAttribute(k);
+            else el.setAttribute(k, v);
+          }
+          if (op.textContent !== undefined) {
+            assertNoScript(op.textContent);
+            el.textContent = op.textContent;
+          }
         }
       } else if (op.op === "remove") {
         if (PROTECTED_IDS.has(op.id)) {
@@ -364,8 +434,6 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
         }
       } else if (op.op === "setDefs") {
         sanitizeDefsSvg(op.defsSvg);
-        const wrapped = `<svg xmlns="${SVG_NS}"><defs>${op.defsSvg}</defs></svg>`;
-        assertWellFormedXml(wrapped);
         const defs = getElById(doc, "pica-defs");
         if (!defs) throw new Error("pica_patch setDefs failed: #pica-defs not found.");
         defs.innerHTML = op.defsSvg;
@@ -376,9 +444,10 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
     const out = serializeDoc(doc);
     assertNoScript(out);
     assertWellFormedXml(out);
-    await atomicWriteFile(input.path, out);
-    setCurrentSvg(input.path, out);
-    return okText({ ok: true, path: input.path, applied: input.ops.length });
+    assertSafeSvgTree(loadXmlDoc(out));
+    await atomicWriteFile(safePath, out);
+    setCurrentSvg(safePath, out);
+    return okText({ ok: true, path: safePath, applied: input.ops.length });
   } catch (e) {
     return errText(`pica_patch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -416,29 +485,130 @@ function animationTokenRe(name: string): RegExp {
   return new RegExp(`(?<![A-Za-z0-9_-])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9_-])`);
 }
 
+function splitAnimationList(value: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i] as string;
+    if (ch === "(") depth++;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    if (ch === "," && depth === 0) {
+      const t = cur.trim();
+      if (t.length > 0) out.push(t);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  const tail = cur.trim();
+  if (tail.length > 0) out.push(tail);
+  return out;
+}
+
+function animationEntryName(entry: string): string {
+  const first = entry.trim().split(/\s+/)[0] ?? "";
+  return first;
+}
+
+function parseEntryTiming(entry: string): { durationMs: number; delayMs: number; iterations: number } {
+  const timeRe = /(\d+(?:\.\d+)?)(ms|s)\b/gi;
+  const times: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = timeRe.exec(entry)) !== null) {
+    const num = Number.parseFloat(m[1] as string);
+    const unit = (m[2] as string).toLowerCase();
+    if (!Number.isFinite(num)) continue;
+    times.push(unit === "s" ? num * 1000 : num);
+  }
+  const durationMs = times[0] ?? 1000;
+  const delayMs = times[1] ?? 0;
+  let iterations = 1;
+  if (/infinite/i.test(entry)) {
+    iterations = 1;
+  } else {
+    const withoutTimes = entry.replace(/(\d+(?:\.\d+)?)(ms|s)\b/gi, " ");
+    const withoutFuncs = withoutTimes.replace(/\([^)]*\)/g, " ");
+    const withoutName = withoutFuncs.replace(/^\s*[A-Za-z_][A-Za-z0-9_-]*\s+/, " ");
+    const numRe = /(^|\s)(\d+(?:\.\d+)?)(\s|,|$)/;
+    const nm = numRe.exec(` ${withoutName} `);
+    if (nm?.[2]) {
+      const n = Number.parseFloat(nm[2]);
+      if (Number.isFinite(n) && n > 0) iterations = n;
+    }
+  }
+  return { durationMs, delayMs, iterations };
+}
+
+function extractAnimationDecl(body: string): string | null {
+  const m = /animation\s*:\s*([^;]+);?/i.exec(body);
+  return m?.[1]?.trim() ?? null;
+}
+
+function recalcDurationMs(css: string, baseDurationMs: number): number {
+  let maxEnd = 0;
+  const ruleRe = /#([A-Za-z0-9_-]+)\s*\{([^}]*)\}/g;
+  let m: RegExpExecArray | null;
+  while ((m = ruleRe.exec(css)) !== null) {
+    const body = m[2] as string;
+    const decl = extractAnimationDecl(body);
+    if (!decl) continue;
+    for (const entry of splitAnimationList(decl)) {
+      if (!entry.trim()) continue;
+      const { durationMs, delayMs, iterations } = parseEntryTiming(entry);
+      const end = delayMs + durationMs * iterations;
+      if (end > maxEnd) maxEnd = end;
+    }
+  }
+  return Math.max(baseDurationMs, Math.ceil(maxEnd));
+}
+
 function removeRulesReferencing(css: string, name: string): string {
-  const re = animationTokenRe(name);
-  return css.replace(/#([A-Za-z0-9_-]+)\s*\{([^}]*)\}/g, (full, _id: string, body: string) => {
-    if (re.test(body)) return "";
-    return full;
+  const tokenRe = animationTokenRe(name);
+  return css.replace(/#([A-Za-z0-9_-]+)\s*\{([^}]*)\}/g, (full: string, _id: string, body: string) => {
+    if (!tokenRe.test(body)) return full;
+    const animMatch = /animation\s*:\s*([^;]+);?/i.exec(body);
+    if (!animMatch?.[1]) {
+      return "";
+    }
+    const entries = splitAnimationList(animMatch[1] as string).filter(
+      (e) => animationEntryName(e) !== name,
+    );
+    if (entries.length === 0) {
+      return "";
+    }
+    const filteredDecl = `animation: ${entries.join(", ")};`;
+    const updated = body.replace(/animation\s*:\s*[^;]+;?/i, filteredDecl);
+    return `#${_id} { ${updated} }`;
   });
 }
 
 function upsertIdRule(css: string, id: string, animationValue: string, origin: string): string {
+  const entryName = animationEntryName(animationValue);
   const re = new RegExp(`#${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "g");
   const boxDecl = "transform-box: fill-box;";
   const originDecl = `transform-origin: ${origin};`;
-  const animDecl = `animation: ${animationValue};`;
   let found = false;
   const next = css.replace(re, (full: string, body: string) => {
     found = true;
     let updated = body;
-    // Replace or append animation declaration.
-    if (/animation\s*:/.test(updated)) {
-      updated = updated.replace(/animation\s*:[^;]+;?/, animDecl);
+    const existingDecl = extractAnimationDecl(updated);
+    if (existingDecl) {
+      const entries = splitAnimationList(existingDecl);
+      let replaced = false;
+      const nextEntries = entries.map((e) => {
+        if (animationEntryName(e) === entryName) {
+          replaced = true;
+          return animationValue;
+        }
+        return e;
+      });
+      if (!replaced) nextEntries.push(animationValue);
+      const newDecl = `animation: ${nextEntries.join(", ")};`;
+      updated = updated.replace(/animation\s*:\s*[^;]+;?/i, newDecl);
     } else {
       const t = updated.trim();
-      updated = `${updated}${t.length > 0 && !t.endsWith(";") ? ";" : ""} ${animDecl}`;
+      updated = `${updated}${t.length > 0 && !t.endsWith(";") ? ";" : ""} animation: ${animationValue};`;
     }
     // Ensure transform-box: fill-box.
     if (/transform-box\s*:/.test(updated)) {
@@ -455,18 +625,42 @@ function upsertIdRule(css: string, id: string, animationValue: string, origin: s
     return `#${id} { ${updated} }`;
   });
   if (found) return next;
-  return `${next}\n#${id} { ${boxDecl} ${originDecl} ${animDecl} }`;
+  return `${next}\n#${id} { ${boxDecl} ${originDecl} animation: ${animationValue}; }`;
+}
+
+function assertSafeCssValue(field: string, value: string): void {
+  if (/[{};<>]/.test(value)) {
+    throw new Error(`Rejected: dangerous CSS in '${field}'.`);
+  }
+  const lowered = value.toLowerCase();
+  if (
+    lowered.includes("@import") ||
+    lowered.includes("javascript:") ||
+    lowered.includes("expression(") ||
+    lowered.includes("url(")
+  ) {
+    throw new Error(`Rejected: dangerous CSS in '${field}'.`);
+  }
 }
 
 export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promise<ToolResult> {
+  let safePath: string;
+  try {
+    safePath = resolveSafePath(input.path);
+  } catch (e) {
+    return errText(`pica_animate failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
   let raw: string;
   try {
-    raw = await Bun.file(input.path).text();
+    raw = await Bun.file(safePath).text();
   } catch {
-    return errText(`pica_animate failed: file not found: ${input.path}. Create it first with pica_create.`);
+    return errText(`pica_animate failed: file not found: ${safePath}. Create it first with pica_create.`);
   }
   try {
     assertNoScript(raw);
+    if (!ID_RE.test(input.name)) {
+      throw new Error(`pica_animate failed: invalid keyframes name '${input.name}'. Use /^[a-zA-Z_][a-zA-Z0-9_-]*$/.`);
+    }
     if (input.keyframes) assertNoScript(input.keyframes);
     const doc = loadXmlDoc(raw);
     ensurePicaSkeleton(doc);
@@ -474,14 +668,32 @@ export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promi
     if (!styleEl) throw new Error("pica_animate failed: #pica-anim not found.");
     let css = (styleEl.textContent ?? "").trim();
 
+    const persist = async (nextCss: string): Promise<void> => {
+      styleEl.textContent = nextCss;
+      const metaEl = getElById(doc, "pica-meta");
+      if (metaEl) {
+        try {
+          const meta = parseMeta(doc);
+          const base = meta.baseDurationMs ?? meta.durationMs;
+          const recalc = recalcDurationMs(nextCss, base);
+          metaEl.textContent = JSON.stringify({ ...meta, baseDurationMs: base, durationMs: recalc });
+        } catch {
+          // ignore meta update failure
+        }
+      }
+      const out = serializeDoc(doc);
+      assertNoScript(out);
+      assertWellFormedXml(out);
+      assertSafeSvgTree(loadXmlDoc(out));
+      await atomicWriteFile(safePath, out);
+      setCurrentSvg(safePath, out);
+    };
+
     if (input.remove) {
       css = removeKeyframesBlock(css, input.name);
       css = removeRulesReferencing(css, input.name);
-      styleEl.textContent = css;
-      const out = serializeDoc(doc);
-      await atomicWriteFile(input.path, out);
-      setCurrentSvg(input.path, out);
-      return okText({ ok: true, path: input.path, removed: input.name });
+      await persist(css);
+      return okText({ ok: true, path: safePath, removed: input.name });
     }
 
     const existing = parseAnimationsList(css).find((a) => a.name === input.name);
@@ -498,14 +710,30 @@ export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promi
     }
     if (body) {
       assertNoScript(body);
+      const lowered = body.toLowerCase();
+      if (
+        lowered.includes("javascript:") ||
+        lowered.includes("expression(") ||
+        lowered.includes("@import") ||
+        lowered.includes("url(")
+      ) {
+        throw new Error("Rejected: dangerous CSS in keyframes.");
+      }
       css = removeKeyframesBlock(css, input.name);
       css = `${css}\n@keyframes ${input.name} { ${body} }`.trim();
     }
 
-    let maxEnd = 0;
     for (const t of input.animations ?? []) {
       const target = getElById(doc, t.id);
       if (!target) throw new Error(`pica_animate failed: target '#${t.id}' not found.`);
+      if (["pica-meta", "pica-defs", "pica-anim", "pica-root", "pica-bg"].includes(t.id)) {
+        throw new Error(`pica_animate failed: target '#${t.id}' is protected.`);
+      }
+      if (t.easing !== undefined) assertSafeCssValue("easing", t.easing);
+      if (t.transformOrigin !== undefined) assertSafeCssValue("transformOrigin", t.transformOrigin);
+      if (t.direction !== undefined) assertSafeCssValue("direction", t.direction);
+      if (t.fill !== undefined) assertSafeCssValue("fill", t.fill);
+      if (typeof t.iterations === "string") assertSafeCssValue("iterations", t.iterations);
       const dur = t.durationMs ?? 1000;
       const delay = t.delayMs ?? 0;
       const easing = t.easing ?? "ease";
@@ -516,33 +744,11 @@ export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promi
       const origin = t.transformOrigin ?? "center";
       const value = `${input.name} ${dur}ms ${easing} ${delay}ms ${iterStr} ${dir} ${fill}`;
       css = upsertIdRule(css, t.id, value, origin);
-      const iterNum = typeof iter === "number" ? iter : 1;
-      const end = delay + dur * iterNum;
-      if (end > maxEnd) maxEnd = end;
     }
 
-    styleEl.textContent = css;
+    await persist(css);
 
-    if (maxEnd > 0) {
-      const metaEl = getElById(doc, "pica-meta");
-      if (metaEl?.textContent) {
-        try {
-          const meta = parseMeta(doc);
-          if (maxEnd > meta.durationMs) {
-            metaEl.textContent = JSON.stringify({ ...meta, durationMs: Math.ceil(maxEnd) });
-          }
-        } catch {
-          // ignore meta update failure
-        }
-      }
-    }
-
-    const out = serializeDoc(doc);
-    assertNoScript(out);
-    assertWellFormedXml(out);
-    await atomicWriteFile(input.path, out);
-    setCurrentSvg(input.path, out);
-    return okText({ ok: true, path: input.path, name: input.name, targets: (input.animations ?? []).map((t) => t.id) });
+    return okText({ ok: true, path: safePath, name: input.name, targets: (input.animations ?? []).map((t) => t.id) });
   } catch (e) {
     return errText(`pica_animate failed: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -579,29 +785,46 @@ export async function handleInspect(input: z.input<typeof InspectSchema>): Promi
   const requestedScale = input.scale ?? 1;
   const maxWidth = input.maxWidth ?? 1024;
   const timeMs = input.timeMs ?? 0;
+  let safePath: string;
+  try {
+    safePath = resolveSafePath(input.path);
+  } catch (e) {
+    return errText(`pica_inspect failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
   let raw: string;
   try {
-    raw = await Bun.file(input.path).text();
+    raw = await Bun.file(safePath).text();
   } catch {
-    return errText(`pica_inspect failed: file not found: ${input.path}.`);
+    return errText(`pica_inspect failed: file not found: ${safePath}.`);
   }
   try {
     const parsed = parsePica(stripDebugOverlay(raw));
     const clean = stripDebugOverlay(raw);
+    const animated = parsed.animations.length > 0;
     // Cap preview width so 4K canvases never flood agent context.
     const effScale = Math.max(
       0.05,
       Math.min(requestedScale, maxWidth / Math.max(1, parsed.width)),
     );
+    let overlayNodes: Array<{ id: string; bbox: Bbox }> = parsed.nodesFlat;
+    if (showIds && findChromeBinary() && (animated || timeMs > 0 || /\btransform\s*[=:]/.test(clean))) {
+      try {
+        const exact = await getRenderedBboxesAtTime(clean, parsed.width, parsed.height, timeMs);
+        if (exact.length > 0) {
+          overlayNodes = exact;
+        }
+      } catch {
+        // fall back to fast bboxes
+      }
+    }
     let svgForRender = clean;
     if (showGrid || showIds) {
-      const overlay = buildDebugOverlay(parsed.width, parsed.height, parsed.nodesFlat, showGrid, showIds);
+      const overlay = buildDebugOverlay(parsed.width, parsed.height, overlayNodes, showGrid, showIds);
       svgForRender = clean.replace(/<\/svg\s*>\s*$/i, `${overlay}</svg>`);
     }
     let png: Buffer;
     let renderer = "resvg";
     let note = "";
-    const animated = parsed.animations.length > 0;
     if (timeMs === 0 && !animated) {
       png = renderPngBuffer(svgForRender, effScale);
     } else if (findChromeBinary()) {
@@ -646,11 +869,21 @@ export async function handleExport(input: z.input<typeof ExportSchema>): Promise
   const scale = input.scale ?? 1;
   const quality = input.quality ?? 90;
   const animated = input.animated ?? false;
+  const timeMs = input.timeMs ?? 0;
+  let safePath: string;
+  let safeOut: string;
+  try {
+    safePath = resolveSafePath(input.path);
+    safeOut = resolveSafePath(input.outPath);
+    assertSafeFfmpegOutPath(input.outPath, safeOut);
+  } catch (e) {
+    return errText(`pica_export failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
   let raw: string;
   try {
-    raw = await Bun.file(input.path).text();
+    raw = await Bun.file(safePath).text();
   } catch {
-    return errText(`pica_export failed: file not found: ${input.path}.`);
+    return errText(`pica_export failed: file not found: ${safePath}.`);
   }
   try {
     const parsed = parsePica(raw);
@@ -659,26 +892,51 @@ export async function handleExport(input: z.input<typeof ExportSchema>): Promise
     const h = Math.round(parsed.height * scale);
 
     if (input.format === "svg") {
-      await exportSvgClean(input.path, input.outPath);
-      return okText({ ok: true, format: "svg", outPath: input.outPath, width: parsed.width, height: parsed.height });
+      if (timeMs !== 0) {
+        return errText("pica_export failed: timeMs is only supported for raster/video exports.");
+      }
+      await exportSvgClean(safePath, safeOut);
+      return okText({ ok: true, format: "svg", outPath: safeOut, width: parsed.width, height: parsed.height });
     }
+    const needsChromiumFrame = timeMs > 0 || (parsed.animations.length > 0 && !!findChromeBinary());
     if (input.format === "png") {
-      await exportPng(input.path, input.outPath, scale);
-      return okText({ ok: true, format: "png", outPath: input.outPath, width: w, height: h });
+      if (timeMs > 0 && !findChromeBinary()) {
+        return errText(`pica_export failed at timeMs=${timeMs}: ${chromeMissingMessage()}`);
+      }
+      if (needsChromiumFrame && findChromeBinary()) {
+        await exportPngAtTime(clean, parsed.width, parsed.height, safeOut, scale, timeMs);
+      } else {
+        await exportPng(safePath, safeOut, scale);
+      }
+      return okText({ ok: true, format: "png", outPath: safeOut, width: w, height: h, timeMs });
     }
     if (input.format === "jpg" || input.format === "jpeg") {
       if (!ffmpegExists()) {
         return errText("pica_export failed: ffmpeg not found in PATH. Install ffmpeg for jpg/jpeg encoding.");
       }
-      await exportStaticRaster(input.path, input.outPath, "jpg", quality, scale);
-      return okText({ ok: true, format: input.format, outPath: input.outPath, width: w, height: h, quality });
+      if (timeMs > 0 && !findChromeBinary()) {
+        return errText(`pica_export failed at timeMs=${timeMs}: ${chromeMissingMessage()}`);
+      }
+      if (needsChromiumFrame && findChromeBinary()) {
+        await exportStaticRasterAtTime(clean, parsed.width, parsed.height, safeOut, "jpg", quality, scale, timeMs);
+      } else {
+        await exportStaticRaster(safePath, safeOut, "jpg", quality, scale);
+      }
+      return okText({ ok: true, format: input.format, outPath: safeOut, width: w, height: h, quality, timeMs });
     }
     if (input.format === "webp" && !animated) {
       if (!ffmpegExists()) {
         return errText("pica_export failed: ffmpeg not found in PATH. Install ffmpeg for webp encoding.");
       }
-      await exportStaticRaster(input.path, input.outPath, "webp", quality, scale);
-      return okText({ ok: true, format: "webp", animated: false, outPath: input.outPath, width: w, height: h });
+      if (timeMs > 0 && !findChromeBinary()) {
+        return errText(`pica_export failed at timeMs=${timeMs}: ${chromeMissingMessage()}`);
+      }
+      if (needsChromiumFrame && findChromeBinary()) {
+        await exportStaticRasterAtTime(clean, parsed.width, parsed.height, safeOut, "webp", quality, scale, timeMs);
+      } else {
+        await exportStaticRaster(safePath, safeOut, "webp", quality, scale);
+      }
+      return okText({ ok: true, format: "webp", animated: false, outPath: safeOut, width: w, height: h, timeMs });
     }
     // Animated paths need chromium + ffmpeg
     if (!findChromeBinary()) {
@@ -690,12 +948,12 @@ export async function handleExport(input: z.input<typeof ExportSchema>): Promise
     const fps = input.fps ?? parsed.meta.fps ?? 30;
     const durationMs = parsed.meta.durationMs ?? 2000;
     if (input.format === "mp4") {
-      await exportAnimated(clean, parsed.width, parsed.height, input.outPath, "mp4", fps, durationMs, scale, quality);
-      return okText({ ok: true, format: "mp4", outPath: input.outPath, width: w, height: h, fps, durationMs });
+      await exportAnimated(clean, parsed.width, parsed.height, safeOut, "mp4", fps, durationMs, scale, quality);
+      return okText({ ok: true, format: "mp4", outPath: safeOut, width: w, height: h, fps, durationMs });
     }
     // animated webp
-    await exportAnimated(clean, parsed.width, parsed.height, input.outPath, "webp", fps, durationMs, scale, quality);
-    return okText({ ok: true, format: "webp", animated: true, outPath: input.outPath, width: w, height: h, fps, durationMs });
+    await exportAnimated(clean, parsed.width, parsed.height, safeOut, "webp", fps, durationMs, scale, quality);
+    return okText({ ok: true, format: "webp", animated: true, outPath: safeOut, width: w, height: h, fps, durationMs });
   } catch (e) {
     return errText(`pica_export failed: ${e instanceof Error ? e.message : String(e)}`);
   }

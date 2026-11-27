@@ -41,7 +41,7 @@ export function createServer(): McpServer {
     "pica_patch",
     {
       title: "Patch canvas",
-      description: "Apply batch DOM mutations (add, update, remove, reorder, setDefs) atomically by #id. Rejects <script>.",
+      description: "Apply batch DOM mutations (add, update, remove, reorder, setDefs) atomically by #id. DOM-based SVG sanitization rejects <script> and other unsafe markup; pica-meta, pica-defs, pica-anim, and pica-root are blocked from mutation, while pica-bg allows safe styling attributes (fill, opacity, fill-opacity).",
       inputSchema: PatchSchema,
     },
     async (args) => handlePatch(args),
@@ -51,7 +51,7 @@ export function createServer(): McpServer {
     "pica_animate",
     {
       title: "Animate canvas",
-      description: "Add, update, or remove @keyframes and #id animation rules in <style id='pica-anim'>. Auto-extends durationMs.",
+      description: "Add, update, or remove @keyframes and #id animation rules in <style id='pica-anim'>. Multiple animations stack as comma-separated entries per #id; durationMs is recalculated automatically.",
       inputSchema: AnimateSchema,
     },
     async (args) => handleAnimate(args),
@@ -71,7 +71,7 @@ export function createServer(): McpServer {
     "pica_export",
     {
       title: "Export asset",
-      description: "Export svg, png, jpg/jpeg, static webp, mp4, or animated webp. Video uses Chromium frames piped to ffmpeg.",
+      description: "Export svg, png, jpg/jpeg, static webp, mp4, or animated webp. Static frames use resvg or timeMs capture via Chromium; animated exports use Chromium frames piped to ffmpeg.",
       inputSchema: ExportSchema,
     },
     async (args) => handleExport(args),

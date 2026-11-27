@@ -1,4 +1,5 @@
 import { DOMParser } from "linkedom";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fastBbox, unionBboxes } from "./bbox.js";
 
 export const SVG_NS = "http://www.w3.org/2000/svg";
@@ -8,6 +9,7 @@ export interface PicaMeta {
   fps: number;
   durationMs: number;
   background: string;
+  baseDurationMs?: number;
 }
 
 export interface Bbox {
@@ -61,7 +63,7 @@ export function buildPicaSvg(opts: {
   durationMs: number;
 }): string {
   const { width, height, background, fps, durationMs } = opts;
-  const meta: PicaMeta = { version: 1, fps, durationMs, background };
+  const meta: PicaMeta = { version: 1, fps, durationMs, background, baseDurationMs: durationMs };
   const metaJson = JSON.stringify(meta);
   return (
     `<svg xmlns="${SVG_NS}" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
@@ -76,19 +78,24 @@ export function buildPicaSvg(opts: {
 
 export async function atomicWriteFile(path: string, content: string | Uint8Array): Promise<void> {
   const { dirname } = await import("node:path");
-  const { rename } = await import("node:fs/promises");
+  const { rename, unlink } = await import("node:fs/promises");
   const dir = dirname(path);
   if (dir && dir !== "." && dir !== "") {
     const { mkdir } = await import("node:fs/promises");
     await mkdir(dir, { recursive: true });
   }
   const tmp = `${path}.tmp.${process.pid}.${Math.floor(Math.random() * 1e9)}`;
-  if (typeof content === "string") {
+  try {
     await Bun.write(tmp, content);
-  } else {
-    await Bun.write(tmp, content);
+    await rename(tmp, path);
+  } catch (e) {
+    try {
+      await unlink(tmp);
+    } catch {
+      // ignore cleanup failure
+    }
+    throw e;
   }
-  await rename(tmp, path);
 }
 
 export async function atomicWriteBinary(path: string, data: Uint8Array): Promise<void> {
@@ -202,18 +209,118 @@ export function parseMeta(doc: Document): PicaMeta {
   try {
     const raw = metaEl.textContent.trim();
     const j = JSON.parse(raw) as Partial<PicaMeta>;
+    const durationMs =
+      typeof j.durationMs === "number" && Number.isFinite(j.durationMs)
+        ? j.durationMs
+        : fallback.durationMs;
+    const baseRaw = (j as Partial<PicaMeta>).baseDurationMs;
     return {
       version: 1,
       fps: typeof j.fps === "number" && Number.isFinite(j.fps) ? j.fps : fallback.fps,
-      durationMs:
-        typeof j.durationMs === "number" && Number.isFinite(j.durationMs)
-          ? j.durationMs
-          : fallback.durationMs,
+      durationMs,
       background: typeof j.background === "string" ? j.background : fallback.background,
+      baseDurationMs:
+        typeof baseRaw === "number" && Number.isFinite(baseRaw) ? baseRaw : durationMs,
     };
   } catch {
     return fallback;
   }
+}
+
+export function resolveSafePath(inputPath: string): string {
+  if (inputPath.includes("\0")) {
+    throw new Error("Rejected: path contains null bytes.");
+  }
+  const resolved = resolve(inputPath);
+  const rootRaw = process.env["PICA_ROOT"];
+  if (rootRaw && rootRaw.length > 0) {
+    if (rootRaw.includes("\0")) {
+      throw new Error("Rejected: PICA_ROOT contains null bytes.");
+    }
+    const root = resolve(rootRaw);
+    const rel = relative(root, resolved);
+    if (rel === ".." || rel.startsWith(`..${sep}`) || rel.startsWith("../") || isAbsolute(rel)) {
+      throw new Error(`Rejected: path escapes PICA_ROOT (${root}).`);
+    }
+  }
+  return resolved;
+}
+
+const FORBIDDEN_TAG_SET = new Set(["script", "foreignobject", "iframe", "object", "embed", "applet"]);
+
+export function localTagName(tagName: string): string {
+  const parts = tagName.split(":");
+  const last = parts[parts.length - 1] ?? tagName;
+  return last.toLowerCase();
+}
+
+export function localAttrName(attrName: string): string {
+  const parts = attrName.split(":");
+  const last = parts[parts.length - 1] ?? attrName;
+  return last.toLowerCase();
+}
+
+export function isForbiddenTag(tagName: string): boolean {
+  return FORBIDDEN_TAG_SET.has(localTagName(tagName));
+}
+
+export function cleanUrlValue(value: string): string {
+  return value.replace(/[\x00-\x20\x7F]+/g, "").toLowerCase();
+}
+
+export function assertSafeAttrValue(_attrName: string, value: string): void {
+  const cleaned = cleanUrlValue(value);
+  if (cleaned.includes("javascript:") || cleaned.includes("vbscript:") || cleaned.includes("data:text/html")) {
+    throw new Error(`Rejected: dangerous URL in attribute '${_attrName}'.`);
+  }
+}
+
+export function assertSafeAttributesRecord(attrs: Record<string, string | null | undefined>): void {
+  for (const [k, v] of Object.entries(attrs)) {
+    if (localAttrName(k).startsWith("on")) {
+      throw new Error(`Rejected: event-handler attribute '${k}' is not allowed.`);
+    }
+    if (v === null || v === undefined) continue;
+    assertSafeAttrValue(k, String(v));
+  }
+}
+
+export function assertSafeSvgTree(doc: Document): void {
+  const qsa = (doc as unknown as { querySelectorAll(sel: string): ArrayLike<Element> }).querySelectorAll;
+  if (typeof qsa !== "function") return;
+  const els = (doc as unknown as { querySelectorAll(sel: string): Element[] }).querySelectorAll("*");
+  for (const el of els) {
+    const tag = (el as unknown as { tagName?: string }).tagName ?? (el as unknown as { tag?: string }).tag ?? "";
+    if (tag && isForbiddenTag(String(tag))) {
+      throw new Error(`Rejected: <${String(tag)}> elements are not allowed.`);
+    }
+    const attrList = (el as unknown as { attributes?: ArrayLike<{ name: string; value: string }> }).attributes;
+    if (attrList) {
+      for (let i = 0; i < attrList.length; i++) {
+        const a = attrList[i];
+        if (!a) continue;
+        const lname = localAttrName(a.name);
+        if (lname.startsWith("on")) {
+          throw new Error(`Rejected: event-handler attribute '${a.name}' is not allowed.`);
+        }
+        assertSafeAttrValue(a.name, a.value);
+      }
+    }
+    if (localTagName(String(tag)) === "style") {
+      const css = (el.textContent ?? "").toLowerCase();
+      if (css.includes("javascript:") || css.includes("expression(") || css.includes("@import")) {
+        throw new Error("Rejected: dangerous CSS in <style>.");
+      }
+    }
+  }
+}
+
+export function assertSafeDefsSvg(defsSvg: string): void {
+  assertNoScript(defsSvg);
+  const wrapped = `<svg xmlns="${SVG_NS}"><defs>${defsSvg}</defs></svg>`;
+  assertWellFormedXml(wrapped);
+  const doc = new DOMParser().parseFromString(wrapped, "text/xml") as unknown as Document;
+  assertSafeSvgTree(doc);
 }
 
 export function parseAnimationsList(cssText: string): PicaAnimations[] {
