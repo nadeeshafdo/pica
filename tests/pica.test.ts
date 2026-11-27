@@ -2,10 +2,11 @@ import { describe, expect, test, afterAll } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { captureFrames, closeBrowser, findChromeBinary } from "../src/chromium.js";
-import { extractKeyframesBody } from "../src/pica-file.js";
+import { captureFrames, closeBrowser, findChromeBinary, getRenderedBboxesAtTime, screenshotAtTime } from "../src/chromium.js";
+import { extractKeyframesBody, resolveSafePath } from "../src/pica-file.js";
 import { normalizeFontAliases, renderPixels, renderPngBuffer } from "../src/render.js";
 import { handleAnimate, handleCreate, handleExport, handleInspect, handlePatch, handleRead } from "../src/tools.js";
+import { isAllowedOrigin, setCurrentSvg, startPreviewServer } from "../src/preview.js";
 
 function ffmpegAvailable(): boolean {
   const w = (Bun as unknown as { which?: (b: string) => string | null }).which;
@@ -412,7 +413,7 @@ describe("chromium", () => {
     }
     // "pica" at 40px must produce hundreds of near-white pixels, not a flat bg.
     expect(bright).toBeGreaterThan(200);
-  });
+  }, 30000);
 
   test("exact bbox, timed inspect, animated mp4/webp", async () => {
     if (!findChromeBinary()) {
@@ -558,4 +559,424 @@ describe("chromium", () => {
       await rm(dir, { recursive: true, force: true });
     }
   }, 180000);
+});
+
+describe("hardening", () => {
+  test("setDefs rejects event-handler, encoded js, foreignObject, style import", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-hard-"));
+    try {
+      const path = join(dir, "h.pica.svg");
+      expect((await handleCreate({ path, width: 400, height: 300 })).isError).toBeFalsy();
+      const cases: Array<{ name: string; defs: string }> = [
+        { name: "nospace-onload", defs: `<rect/onload=alert(1) />` },
+        { name: "encoded-js", defs: `<a href="&#106;avascript:alert(1)" />` },
+        { name: "foreign", defs: `<foreignObject><div>hi</div></foreignObject>` },
+        { name: "style-import", defs: `<style>@import url(http://evil)</style>` },
+      ];
+      for (const c of cases) {
+        const res = await handlePatch({ path, ops: [{ op: "setDefs", defsSvg: c.defs }] });
+        expect(res.isError).toBe(true);
+        expect(textOf(res as never)).toMatch(/Rejected|not allowed|dangerous/i);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("patch update rejects skeleton mutations", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-skel-"));
+    try {
+      const path = join(dir, "s.pica.svg");
+      expect((await handleCreate({ path, width: 400, height: 300 })).isError).toBeFalsy();
+      for (const id of ["pica-meta", "pica-defs", "pica-anim", "pica-root"]) {
+        const res = await handlePatch({ path, ops: [{ op: "update", id, attrs: { fill: "red" } }] });
+        expect(res.isError).toBe(true);
+        expect(textOf(res as never)).toMatch(/protected/i);
+      }
+      const bgBadAttr = await handlePatch({ path, ops: [{ op: "update", id: "pica-bg", attrs: { width: 5 } }] });
+      expect(bgBadAttr.isError).toBe(true);
+      const bgBadText = await handlePatch({ path, ops: [{ op: "update", id: "pica-bg", textContent: "hi" }] });
+      expect(bgBadText.isError).toBe(true);
+      const bgBadId = await handlePatch({ path, ops: [{ op: "update", id: "pica-bg", attrs: { id: "x" } }] });
+      expect(bgBadId.isError).toBe(true);
+      const bgOk = await handlePatch({ path, ops: [{ op: "update", id: "pica-bg", attrs: { fill: "#000000" } }] });
+      expect(bgOk.isError).toBeFalsy();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("PICA_ROOT traversal and ffmpeg outPath guard", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-root-"));
+    const old = process.env["PICA_ROOT"];
+    try {
+      const path = join(dir, "c.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      process.env["PICA_ROOT"] = dir;
+      const escape = join(dir, "..", "escape.pica.svg");
+      const trav = await handleCreate({ path: escape, width: 100, height: 100 });
+      expect(trav.isError).toBe(true);
+      expect(textOf(trav as never)).toMatch(/escapes PICA_ROOT/i);
+      expect(() => resolveSafePath(`${dir}/a\0b.svg`)).toThrow();
+      // Flag/protocol checks must run with PICA_ROOT unset so the raw
+      // outPath guard (not the jail) is what rejects them.
+      if (old === undefined) delete process.env["PICA_ROOT"];
+      else process.env["PICA_ROOT"] = old;
+      const flag = await handleExport({ path, format: "png", outPath: "-evil.png", scale: 1, quality: 90, animated: false });
+      expect(flag.isError).toBe(true);
+      expect(textOf(flag as never)).toMatch(/ffmpeg flag/i);
+      const proto = await handleExport({ path, format: "png", outPath: "http://evil/x.png", scale: 1, quality: 90, animated: false });
+      expect(proto.isError).toBe(true);
+      expect(textOf(proto as never)).toMatch(/protocol/i);
+    } finally {
+      if (old === undefined) delete process.env["PICA_ROOT"];
+      else process.env["PICA_ROOT"] = old;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("websocket origin check", () => {
+    expect(isAllowedOrigin(null, 4173)).toBe(true);
+    expect(isAllowedOrigin("http://127.0.0.1:4173", 4173)).toBe(true);
+    expect(isAllowedOrigin("http://localhost:4173", 4173)).toBe(true);
+    expect(isAllowedOrigin("https://evil.example", 4173)).toBe(false);
+    expect(isAllowedOrigin("http://127.0.0.1:9999", 4173)).toBe(false);
+  });
+
+  test("preview rejects cross-origin ws and accepts same-origin", async () => {
+    const oldPort = process.env["PICA_PORT"];
+    process.env["PICA_PORT"] = "0";
+    const srv = startPreviewServer();
+    try {
+      if (!srv) {
+        console.error("skip ws origin test: preview failed to start");
+        return;
+      }
+      const port = srv.port;
+      const evil = await fetch(`http://127.0.0.1:${port}/ws`, { headers: { Origin: "https://evil.example" } });
+      expect(evil.status).toBe(403);
+      await evil.text().catch(() => undefined);
+      const okRes = await fetch(`http://127.0.0.1:${port}/ws`);
+      expect([403, 426]).toContain(okRes.status);
+      expect(okRes.status).not.toBe(403);
+      await okRes.text().catch(() => undefined);
+    } finally {
+      try {
+        (srv as { stop?: () => void })?.stop?.();
+      } catch {
+        // ignore
+      }
+      if (oldPort === undefined) delete process.env["PICA_PORT"];
+      else process.env["PICA_PORT"] = oldPort;
+    }
+  }, 60000);
+
+  test("preview falls back to ephemeral port when busy", async () => {
+    const blocker = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("busy") });
+    const busyPort = blocker.port;
+    const oldPort = process.env["PICA_PORT"];
+    process.env["PICA_PORT"] = String(busyPort);
+    try {
+      const srv = startPreviewServer();
+      expect(srv).not.toBeNull();
+      expect(srv!.port).not.toBe(busyPort);
+      const res = await fetch(`http://127.0.0.1:${srv!.port}/`);
+      expect(res.status).toBe(200);
+      await res.text().catch(() => undefined);
+      try {
+        (srv as { stop?: () => void })?.stop?.();
+      } catch {
+        // ignore
+      }
+    } finally {
+      try {
+        blocker.stop();
+      } catch {
+        // ignore
+      }
+      if (oldPort === undefined) delete process.env["PICA_PORT"];
+      else process.env["PICA_PORT"] = oldPort;
+    }
+  }, 60000);
+});
+
+describe("animation stacking and duration", () => {
+  test("stacks, updates one, removes one", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-stack-"));
+    try {
+      const path = join(dir, "s.pica.svg");
+      expect((await handleCreate({ path, width: 400, height: 300 })).isError).toBeFalsy();
+      expect(
+        (await handlePatch({ path, ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 0, y: 0, width: 10, height: 10 } }] })).isError,
+      ).toBeFalsy();
+      expect(
+        (await handleAnimate({ path, name: "fadeUp", keyframes: "0%{opacity:0}100%{opacity:1}", animations: [{ id: "r1", durationMs: 1000 }] })).isError,
+      ).toBeFalsy();
+      expect(
+        (await handleAnimate({ path, name: "float", keyframes: "0%{transform:translateY(0)}100%{transform:translateY(5px)}", animations: [{ id: "r1", durationMs: 800 }] })).isError,
+      ).toBeFalsy();
+      let raw = await Bun.file(path).text();
+      expect(raw).toMatch(/fadeUp/);
+      expect(raw).toMatch(/float/);
+      expect(raw).toMatch(/animation:[^;]*fadeUp[^;]*,\s*[^;]*float|animation:[^;]*float[^;]*,\s*[^;]*fadeUp|animation:[^;]*fadeUp[^;]*float/);
+      // update fadeUp duration without clobbering float
+      expect(
+        (await handleAnimate({ path, name: "fadeUp", animations: [{ id: "r1", durationMs: 2000 }] })).isError,
+      ).toBeFalsy();
+      raw = await Bun.file(path).text();
+      expect(raw).toMatch(/fadeUp 2000ms/);
+      expect(raw).toMatch(/float/);
+      // remove fadeUp keeps float
+      expect((await handleAnimate({ path, name: "fadeUp", remove: true })).isError).toBeFalsy();
+      raw = await Bun.file(path).text();
+      expect(raw).not.toMatch(/@keyframes\s+fadeUp(?![A-Za-z0-9_-])/);
+      expect(raw).toMatch(/float/);
+      expect(raw).toMatch(/#r1\s*\{[^}]*animation:/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("durationMs grows and shrinks to base", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-dur-"));
+    try {
+      const path = join(dir, "d.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200, durationMs: 2000 })).isError).toBeFalsy();
+      expect(
+        (await handlePatch({ path, ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 0, y: 0, width: 5, height: 5 } }] })).isError,
+      ).toBeFalsy();
+      expect(
+        (await handleAnimate({ path, name: "long", keyframes: "0%{opacity:0}100%{opacity:1}", animations: [{ id: "r1", durationMs: 5000 }] })).isError,
+      ).toBeFalsy();
+      let read = await handleRead({ path, bboxMode: "fast" });
+      let j = JSON.parse(textOf(read as never)) as { meta: { durationMs: number; baseDurationMs?: number } };
+      expect(j.meta.durationMs).toBe(5000);
+      expect(j.meta.baseDurationMs).toBe(2000);
+      expect((await handleAnimate({ path, name: "long", remove: true })).isError).toBeFalsy();
+      read = await handleRead({ path, bboxMode: "fast" });
+      j = JSON.parse(textOf(read as never)) as { meta: { durationMs: number } };
+      expect(j.meta.durationMs).toBe(2000);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+describe("chromium hardening and timed export", () => {
+  afterAll(async () => {
+    await closeBrowser();
+  });
+
+  test("blocks external http from svg image", async () => {
+    if (!findChromeBinary()) {
+      console.error("skip block test: chromium missing");
+      return;
+    }
+    let hits = 0;
+    const srv = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () => {
+        hits++;
+        return new Response("evil", { headers: { "Content-Type": "text/plain" } });
+      },
+    });
+    try {
+      const evilUrl = `http://127.0.0.1:${srv.port}/evil.png`;
+      const svg =
+        `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150">` +
+        `<rect width="200" height="150" fill="#ffffff"/>` +
+        `<image href="${evilUrl}" x="0" y="0" width="50" height="50"/>` +
+        `</svg>`;
+      await screenshotAtTime(svg, 200, 150, 0, 1);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(hits).toBe(0);
+    } finally {
+      try {
+        srv.stop();
+      } catch {
+        // ignore
+      }
+    }
+  }, 120000);
+
+  test("exact bboxes at time reflect motion", async () => {
+    if (!findChromeBinary()) {
+      console.error("skip exact bbox time test: chromium missing");
+      return;
+    }
+    const dir = await mkdtemp(join(tmpdir(), "pica-bbox-t-"));
+    try {
+      const path = join(dir, "b.pica.svg");
+      expect((await handleCreate({ path, width: 300, height: 200 })).isError).toBeFalsy();
+      expect(
+        (await handlePatch({ path, ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 10, y: 20, width: 40, height: 30, fill: "red" } }] })).isError,
+      ).toBeFalsy();
+      expect(
+        (await handleAnimate({ path, name: "slide", keyframes: "0%{transform:translateX(0)}100%{transform:translateX(80px)}", animations: [{ id: "r1", durationMs: 1000 }] })).isError,
+      ).toBeFalsy();
+      const raw = await Bun.file(path).text();
+      const { parsePica, stripDebugOverlay } = await import("../src/pica-file.js");
+      const parsed = parsePica(stripDebugOverlay(raw));
+      void parsed;
+      const b0 = await getRenderedBboxesAtTime(stripDebugOverlay(raw), 300, 200, 0);
+      const b1 = await getRenderedBboxesAtTime(stripDebugOverlay(raw), 300, 200, 1000);
+      const r0 = b0.find((b) => b.id === "r1");
+      const r1 = b1.find((b) => b.id === "r1");
+      expect(r0).toBeDefined();
+      expect(r1).toBeDefined();
+      expect(Math.abs((r1!.bbox.x - r0!.bbox.x) - 80)).toBeLessThan(6);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 120000);
+
+  test("static export timeMs uses chromium frame", async () => {
+    if (!findChromeBinary()) {
+      console.error("skip timed export test: chromium missing");
+      return;
+    }
+    const dir = await mkdtemp(join(tmpdir(), "pica-texp-"));
+    try {
+      const path = join(dir, "t.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 150 })).isError).toBeFalsy();
+      expect(
+        (await handlePatch({ path, ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 10, y: 10, width: 30, height: 30, fill: "red" } }] })).isError,
+      ).toBeFalsy();
+      expect(
+        (await handleAnimate({ path, name: "slide", keyframes: "0%{transform:translateX(0)}100%{transform:translateX(100px)}", animations: [{ id: "r1", durationMs: 1000 }] })).isError,
+      ).toBeFalsy();
+      const out0 = join(dir, "t0.png");
+      const out1 = join(dir, "t1.png");
+      const e0 = await handleExport({ path, format: "png", outPath: out0, scale: 1, quality: 90, animated: false, timeMs: 0 });
+      expect(e0.isError).toBeFalsy();
+      const e1 = await handleExport({ path, format: "png", outPath: out1, scale: 1, quality: 90, animated: false, timeMs: 1000 });
+      expect(e1.isError).toBeFalsy();
+      const b0 = await Bun.file(out0).arrayBuffer();
+      const b1 = await Bun.file(out1).arrayBuffer();
+      expect(b0.byteLength).toBeGreaterThan(200);
+      expect(b1.byteLength).toBeGreaterThan(200);
+      expect(Buffer.from(b0).equals(Buffer.from(b1))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 120000);
+});
+
+describe("audit regressions", () => {
+  test("cubic-bezier easing does not corrupt durationMs", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-bezier-"));
+    try {
+      const path = join(dir, "b.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      expect(
+        (await handlePatch({ path, ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 0, y: 0, width: 5, height: 5 } }] })).isError,
+      ).toBeFalsy();
+      const res = await handleAnimate({
+        path,
+        name: "slide",
+        keyframes: "0%{transform:translateX(0)}100%{transform:translateX(10px)}",
+        animations: [{ id: "r1", durationMs: 5000, easing: "cubic-bezier(0.22, 1, 0.36, 1)" }],
+      });
+      expect(res.isError).toBeFalsy();
+      const read = await handleRead({ path, bboxMode: "fast" });
+      const j = JSON.parse(textOf(read as never)) as { meta: { durationMs: number } };
+      expect(j.meta.durationMs).toBe(5000);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("pica_animate rejects CSS injection payloads", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-cssinj-"));
+    try {
+      const path = join(dir, "i.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      expect(
+        (await handlePatch({ path, ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 0, y: 0, width: 5, height: 5 } }] })).isError,
+      ).toBeFalsy();
+      const badName = await handleAnimate({
+        path,
+        name: "x; } @import url(http://evil); #x {",
+        keyframes: "0%{opacity:0}100%{opacity:1}",
+        animations: [{ id: "r1" }],
+      });
+      expect(badName.isError).toBe(true);
+      const badEasing = await handleAnimate({
+        path,
+        name: "okName",
+        keyframes: "0%{opacity:0}100%{opacity:1}",
+        animations: [{ id: "r1", easing: "ease; } @import url(http://evil); #x {" }],
+      });
+      expect(badEasing.isError).toBe(true);
+      const badOrigin = await handleAnimate({
+        path,
+        name: "okName2",
+        keyframes: "0%{opacity:0}100%{opacity:1}",
+        animations: [{ id: "r1", transformOrigin: "center; } @import url(http://evil); #x {" }],
+      });
+      expect(badOrigin.isError).toBe(true);
+      const badKeyframesUrl = await handleAnimate({
+        path,
+        name: "evilBg",
+        keyframes: "0%{background-image:url(http://evil/x.png)}100%{opacity:1}",
+        animations: [{ id: "r1" }],
+      });
+      expect(badKeyframesUrl.isError).toBe(true);
+      expect(textOf(badKeyframesUrl as never)).toMatch(/dangerous CSS/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("pica_patch update rejects changing id on a regular shape", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-idmut-"));
+    try {
+      const path = join(dir, "m.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      expect(
+        (await handlePatch({ path, ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 0, y: 0, width: 5, height: 5 } }] })).isError,
+      ).toBeFalsy();
+      const res = await handlePatch({ path, ops: [{ op: "update", id: "r1", attrs: { id: "pica-meta" } }] });
+      expect(res.isError).toBe(true);
+      expect(textOf(res as never)).toMatch(/id/i);
+      const rm2 = await handlePatch({ path, ops: [{ op: "update", id: "r1", attrs: { id: null } }] });
+      expect(rm2.isError).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("preview sends Content-Security-Policy headers", async () => {
+    const oldPort = process.env["PICA_PORT"];
+    process.env["PICA_PORT"] = "0";
+    setCurrentSvg("test.pica.svg", '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>');
+    const srv = startPreviewServer();
+    try {
+      if (!srv) {
+        console.error("skip csp test: preview failed to start");
+        return;
+      }
+      const res = await fetch(`http://127.0.0.1:${srv.port}/`);
+      expect(res.status).toBe(200);
+      const csp = res.headers.get("content-security-policy") ?? "";
+      expect(csp).toMatch(/default-src 'self'/);
+      expect(csp).toMatch(/frame-ancestors 'none'/);
+      await res.text().catch(() => undefined);
+      const svgRes = await fetch(`http://127.0.0.1:${srv.port}/svg`);
+      expect(svgRes.status).toBe(200);
+      const svgCsp = svgRes.headers.get("content-security-policy") ?? "";
+      expect(svgCsp).toMatch(/default-src 'none'/);
+      expect(svgCsp).toMatch(/sandbox/);
+      await svgRes.text().catch(() => undefined);
+    } finally {
+      try {
+        (srv as { stop?: () => void })?.stop?.();
+      } catch {
+        // ignore
+      }
+      if (oldPort === undefined) delete process.env["PICA_PORT"];
+      else process.env["PICA_PORT"] = oldPort;
+    }
+  }, 60000);
 });

@@ -34,6 +34,7 @@ async function loadViewerHtml(): Promise<string> {
   const candidates = [
     new URL("./viewer.html", import.meta.url),
     new URL("../src/viewer.html", import.meta.url),
+    new URL("../../src/viewer.html", import.meta.url),
   ];
   for (const u of candidates) {
     try {
@@ -46,6 +47,12 @@ async function loadViewerHtml(): Promise<string> {
   return "<!doctype html><html><body><p>pica preview: viewer.html missing</p></body></html>";
 }
 
+function isAllowedOrigin(origin: string | null, actualPort: number): boolean {
+  if (!origin) return true;
+  const allowed = new Set([`http://127.0.0.1:${actualPort}`, `http://localhost:${actualPort}`]);
+  return allowed.has(origin);
+}
+
 export function startPreviewServer(): null | ReturnType<typeof Bun.serve> {
   const portRaw = process.env["PICA_PORT"] ?? "4173";
   const port = Number.parseInt(portRaw, 10);
@@ -54,9 +61,17 @@ export function startPreviewServer(): null | ReturnType<typeof Bun.serve> {
 
   app.get("/", async (c) => {
     const html = await loadViewerHtml();
+    c.header(
+      "Content-Security-Policy",
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; object-src 'none'; frame-ancestors 'none'",
+    );
     return c.html(html);
   });
   app.get("/svg", (c) => {
+    c.header(
+      "Content-Security-Policy",
+      "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox",
+    );
     if (!lastSvgText) {
       return c.text("No .pica.svg written yet in this session.", 404);
     }
@@ -65,13 +80,18 @@ export function startPreviewServer(): null | ReturnType<typeof Bun.serve> {
     return c.text(lastSvgText, 200, { "Content-Type": "image/svg+xml" });
   });
 
-  try {
-    const server = Bun.serve({
-      port: safePort,
+  const serveWith = (listenPort: number) =>
+    Bun.serve({
+      port: listenPort,
       hostname: "127.0.0.1",
       fetch(req, srv) {
         const url = new URL(req.url);
         if (url.pathname === "/ws") {
+          const origin = req.headers.get("origin");
+          const actualPort = (srv as unknown as { port?: number }).port ?? listenPort;
+          if (!isAllowedOrigin(origin, actualPort)) {
+            return new Response("Forbidden.", { status: 403 });
+          }
           const ok = srv.upgrade(req);
           if (!ok) return new Response("WebSocket upgrade failed.", { status: 426 });
           return undefined as unknown as Response;
@@ -97,10 +117,22 @@ export function startPreviewServer(): null | ReturnType<typeof Bun.serve> {
         },
       },
     });
+
+  try {
+    const server = serveWith(safePort);
     console.error(`[pica] preview at http://127.0.0.1:${server.port}/`);
     return server;
   } catch (e) {
-    console.error(`[pica] preview server failed to start (port busy?): ${String(e)}`);
-    return null;
+    console.error(`[pica] preview port ${safePort} busy, trying ephemeral port: ${String(e)}`);
+    try {
+      const fallback = serveWith(0);
+      console.error(`[pica] preview at http://127.0.0.1:${fallback.port}/`);
+      return fallback;
+    } catch (e2) {
+      console.error(`[pica] preview server failed to start: ${String(e2)}`);
+      return null;
+    }
   }
 }
+
+export { isAllowedOrigin };

@@ -6,6 +6,12 @@ Headless-first 2D vector design and animation MCP server for local coding agents
 
 Every canvas is a standard, standalone `.pica.svg` file. Agents mutate it cleanly by element `#id`, verify layouts visually through PNG snapshots with optional coordinate grids and bounding-box labels, and export to static or animated formats locally.
 
+## Demo
+
+![pica demo](assets/demo.webp)
+
+Opening hook from the pica launch ad, a 64 second spot authored as `.pica.svg` and exported with `pica_export`.
+
 ## Why pica
 
 | Capability | pica | Cloud Design MCPs | Whiteboard MCPs | Video-in-React Frameworks |
@@ -45,14 +51,20 @@ If `chromium` or `ffmpeg` is missing, static SVG and PNG workflows still work an
 ## Quick Start
 
 ```bash
-git clone [https://github.com/nadeeshafdo/pica.git](https://github.com/nadeeshafdo/pica.git)
+git clone https://github.com/nadeeshafdo/pica.git
 cd pica
 bun install
 ```
 
+Or run without cloning:
+
+```bash
+bunx pica-mcp
+```
+
 ### Add to OpenCode
 
-Add `pica` to `~/.config/opencode/opencode.json`:
+Add `pica` to `~/.config/opencode/opencode.json`. With a local clone:
 
 ```json
 {
@@ -68,10 +80,34 @@ Add `pica` to `~/.config/opencode/opencode.json`:
 }
 ```
 
+Or without cloning:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "pica": {
+        "type": "local",
+        "command": ["bunx", "pica-mcp"],
+        "environment": {}
+      }
+    }
+  }
+}
+```
+
 ### Add to Claude Code
+
+With a local clone:
 
 ```bash
 claude mcp add pica -- bun /absolute/path/to/pica/src/index.ts
+```
+
+Or without cloning:
+
+```bash
+claude mcp add pica -- bunx pica-mcp
 ```
 
 ### Test with MCP Inspector
@@ -118,13 +154,13 @@ Applies atomic batch DOM mutations by `#id`. Rejects `<script>` elements, `on*` 
   - `setDefs`: `{ op: "setDefs", defsSvg }`
 
 ### `pica_animate`
-Adds, updates, or removes `@keyframes` and `#id` animation rules inside `<style id="pica-anim">`. Automatically emits `transform-box: fill-box` and `transform-origin` so rotations and scales anchor to the element instead of `(0, 0)`, and extends metadata `durationMs` when animations run longer than the current timeline.
+Adds, updates, or removes `@keyframes` and `#id` animation rules inside `<style id="pica-anim">`. Automatically emits `transform-box: fill-box` and `transform-origin` so rotations and scales anchor to the element instead of `(0, 0)`, and recalculates metadata `durationMs` from all remaining animations plus `baseDurationMs`. Multiple animations stack as comma-separated `animation:` entries per `#id`; re-applying the same `@keyframes` name updates only that entry, and removing a name strips only its entry.
 
 - `path` (string, required): Target `.pica.svg` file path.
 - `name` (string, required): Keyframes identifier (e.g. `fadeUp`, `spin`).
 - `keyframes` (string, optional): CSS keyframe body (e.g. `"0%{opacity:0}100%{opacity:1}"`). Required when creating a new animation.
 - `animations` (array, optional): Target bindings `{ id, durationMs?, delayMs?, easing?, iterations?, direction?, fill?, transformOrigin? }`.
-- `remove` (boolean, default `false`): Delete the `@keyframes` block and matching `#id` rules safely by exact token match.
+- `remove` (boolean, default `false`): Delete the `@keyframes` block and surgically remove only matching entries from comma-separated `animation:` declarations.
 
 ### `pica_inspect`
 Renders a PNG preview and returns an MCP image block plus a short text summary for visual verification.
@@ -141,18 +177,19 @@ Exports clean assets (debug overlays are always stripped).
 
 - `path` (string, required): Input `.pica.svg` file path.
 - `format` (`"svg" | "png" | "jpg" | "jpeg" | "webp" | "mp4"`, required): Output format.
-- `outPath` (string, required): Destination file path (parent directories are created automatically).
+- `outPath` (string, required): Destination file path (parent directories are created automatically). Rejects `ffmpeg` flag-like (`-...`) and protocol (`://`) paths.
 - `scale` (number, default `1`, max `4`): Output scale multiplier.
 - `quality` (number, default `90`, `0-100`): Compression quality for JPG, WebP, and MP4 (`-crf` mapped, with `+faststart`).
 - `fps` (number, optional): Override document FPS for animated exports.
 - `animated` (boolean, default `false`): Set `true` for animated WebP; MP4 is always animated.
+- `timeMs` (number, default `0`): Static frame timestamp in ms. When `> 0` requires Chromium; animated docs use Chromium at `timeMs` for accurate state even at `0`. Falls back to `resvg` for static docs at `0`.
 
 ## File Format (`.pica.svg`)
 
 Every file is valid standalone SVG with five reserved skeleton elements:
 
 ```xml
-<svg xmlns="[http://www.w3.org/2000/svg](http://www.w3.org/2000/svg)" width="800" height="600" viewBox="0 0 800 600">
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600">
   <metadata id="pica-meta">{"version":1,"fps":30,"durationMs":2000,"background":"#ffffff"}</metadata>
   <defs id="pica-defs"></defs>
   <style id="pica-anim"></style>
@@ -161,21 +198,22 @@ Every file is valid standalone SVG with five reserved skeleton elements:
 </svg>
 ```
 
-All disk writes are atomic (`.tmp` write followed by rename). Because the source of truth is plain SVG and CSS, any browser, vector editor, or git diff tool works with it natively.
+All disk writes are atomic (`.tmp` write followed by rename). Because the source of truth is plain SVG and CSS, any browser, vector editor, or git diff tool works with it natively. Set `PICA_ROOT` to sandbox all file access to one directory tree.
 
 ## Live Preview
 
-When the MCP server starts, it opens an optional local preview server at `http://127.0.0.1:4173` (port failures log to `stderr` and never crash the MCP transport).
+When the MCP server starts, it opens an optional local preview server at `http://127.0.0.1:4173` (port failures log to `stderr` and never crash the MCP transport). If `PICA_PORT` is busy, it automatically falls back to an OS-assigned ephemeral port on `127.0.0.1` and logs the actual URL.
 
 - Checkerboard artboard with wheel zoom, drag pan, and fit-to-screen.
-- Live WebSocket reload on every `pica_create`, `pica_patch`, and `pica_animate` while preserving your current zoom and pan across patches.
+- Live WebSocket reload on every `pica_create`, `pica_patch`, and `pica_animate` while preserving your current zoom and pan across patches. `/ws` upgrades require same-origin (`127.0.0.1` / `localhost`) or missing `Origin`.
 - Bottom timeline scrubber (Play/Pause + time slider) synced with `document.getAnimations()`.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `PICA_PORT` | `4173` | Port for the local Hono live preview server (`127.0.0.1`). |
+| `PICA_PORT` | `4173` | Port for the local Hono live preview server (`127.0.0.1`). Falls back to ephemeral `0` when busy. |
+| `PICA_ROOT` | Unset | When set, all `path` / `outPath` inputs must resolve inside this directory tree. |
 | `CHROME_PATH` / `CHROMIUM_PATH` | Auto-detected | Explicit path to a Chromium or Google Chrome executable. |
 
 ## Development

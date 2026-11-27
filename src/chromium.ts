@@ -283,18 +283,29 @@ async function readBrowserEndpoint(proc: ReturnType<typeof Bun.spawn>): Promise<
   const deadline = Date.now() + 15000;
   try {
     while (Date.now() < deadline) {
-      const { done, value } = await reader.read();
-      if (value) buf += dec.decode(value, { stream: true });
-      const m = buf.match(/DevTools listening on (ws:\/\/\S+)/);
-      if (m?.[1]) {
-        try {
-          reader.releaseLock();
-        } catch {
-          // ignore
+      const timeoutMs = Math.max(0, deadline - Date.now());
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const timeoutP = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("read timeout")), timeoutMs);
+      });
+      try {
+        const { done, value } = await Promise.race([reader.read(), timeoutP]);
+        if (timer) clearTimeout(timer);
+        if (value) buf += dec.decode(value, { stream: true });
+        const m = buf.match(/DevTools listening on (ws:\/\/\S+)/);
+        if (m?.[1]) {
+          try {
+            reader.releaseLock();
+          } catch {
+            // ignore
+          }
+          return m[1];
         }
-        return m[1];
+        if (done) break;
+      } catch {
+        if (timer) clearTimeout(timer);
+        break;
       }
-      if (done) break;
     }
   } finally {
     try {
@@ -304,6 +315,46 @@ async function readBrowserEndpoint(proc: ReturnType<typeof Bun.spawn>): Promise<
     }
   }
   throw new Error("Timed out waiting for Chromium DevTools endpoint. Is chromium installed and runnable with --no-sandbox?");
+}
+
+function isAllowedRequestUrl(url: string): boolean {
+  if (url === "about:blank") return true;
+  const lower = url.toLowerCase();
+  if (lower.startsWith("data:")) {
+    if (lower.startsWith("data:text/html")) return false;
+    return true;
+  }
+  return false;
+}
+
+async function enableFetchBlocking(): Promise<void> {
+  if (!browserConn || !pageSessionId) return;
+  const conn = browserConn;
+  const session = pageSessionId;
+  try {
+    await conn.send("Fetch.enable", { patterns: [{ urlPattern: "*" }] }, session);
+  } catch {
+    return;
+  }
+  conn.on("Fetch.requestPaused", (params: unknown) => {
+    void (async () => {
+      try {
+        const p = params as { requestId?: string; request?: { url?: string } };
+        const requestId = p.requestId;
+        const url = p.request?.url ?? "";
+        if (!requestId) return;
+        if (isAllowedRequestUrl(url)) {
+          await conn.send("Fetch.continueRequest", { requestId }, session).catch(() => undefined);
+        } else {
+          await conn
+            .send("Fetch.failRequest", { requestId, errorReason: "BlockedByClient" }, session)
+            .catch(() => undefined);
+        }
+      } catch {
+        // ignore
+      }
+    })();
+  });
 }
 
 async function startBrowser(): Promise<void> {
@@ -356,6 +407,7 @@ async function startBrowser(): Promise<void> {
       pageSessionId = attached.sessionId;
       await browserConn.send("Page.enable", {}, pageSessionId);
       await browserConn.send("Runtime.enable", {}, pageSessionId);
+      await enableFetchBlocking();
       touchIdle();
     } catch (e) {
       await closeBrowser().catch(() => undefined);
@@ -457,6 +509,50 @@ export async function getExactBboxes(
       });
     })()`,
   );
+    touchIdle();
+    return Array.isArray(out) ? out : [];
+  });
+}
+
+export async function getRenderedBboxesAtTime(
+  svgText: string,
+  width: number,
+  height: number,
+  timeMs: number,
+): Promise<Array<{ id: string; bbox: Bbox }>> {
+  return withCdpLock(async () => {
+    await ensureBrowser();
+    if (!browserConn || !pageSessionId) throw new Error("Browser not started.");
+    const { w, h } = scaledSize(width, height, 1);
+    await applyViewport(w, h, pageSessionId);
+    await setDocumentHtml(htmlWrapper(svgText, w, h));
+    await runtimeEval(
+      `(async () => {
+        document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${Math.max(0, timeMs)}; } catch (e) {} });
+        await new Promise((r) => requestAnimationFrame(() => r(1)));
+        document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${Math.max(0, timeMs)}; } catch (e) {} });
+        return 'ok';
+      })()`,
+      true,
+    );
+    const out = await runtimeEval<Array<{ id: string; bbox: Bbox }>>(
+      `(() => {
+        const svg = document.querySelector('svg');
+        if (!svg) return [];
+        const svgRect = svg.getBoundingClientRect();
+        const root = document.querySelector('#pica-root');
+        if (!root) return [];
+        const els = Array.from(root.querySelectorAll('[id]'));
+        return els.map((el) => {
+          try {
+            const r = el.getBoundingClientRect();
+            return { id: el.id, bbox: { x: r.left - svgRect.left, y: r.top - svgRect.top, w: r.width, h: r.height } };
+          } catch (e) {
+            return { id: el.id, bbox: { x: 0, y: 0, w: 0, h: 0 } };
+          }
+        });
+      })()`,
+    );
     touchIdle();
     return Array.isArray(out) ? out : [];
   });
