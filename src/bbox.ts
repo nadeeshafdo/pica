@@ -107,7 +107,7 @@ function argCountForCmd(cmd: string): number {
 /**
  * Proper SVG path bbox: handles absolute and relative M/L/H/V/C/S/Q/T/A/Z.
  * Control points are included (conservative fast estimate); arcs contribute
- * their endpoints (radii ignored by design for the fast estimate).
+ * their endpoints plus conservative radius bounds for arcs.
  */
 export function pathBbox(d: string): Bbox {
   const toks = tokenizePath(d);
@@ -217,9 +217,25 @@ export function pathBbox(d: string): Bbox {
       push(x, y);
     } else if (C === "A") {
       // rx ry x-axis-rotation large-arc-flag sweep-flag x y
+      const rx = Math.abs(args[0] as number);
+      const ry = Math.abs(args[1] as number);
       const x = (args[5] as number) + (rel ? cx : 0);
       const y = (args[6] as number) + (rel ? cy : 0);
+      push(cx, cy);
       push(x, y);
+      // Conservative radius bounds so flat chords keep area.
+      if (rx > 0 && ry > 0) {
+        const mx = (cx + x) / 2;
+        const my = (cy + y) / 2;
+        if (Math.abs(y - cy) < ry * 2) {
+          push(mx, Math.min(cy, y) - ry);
+          push(mx, Math.max(cy, y) + ry);
+        }
+        if (Math.abs(x - cx) < rx * 2) {
+          push(Math.min(cx, x) - rx, my);
+          push(Math.max(cx, x) + rx, my);
+        }
+      }
       cx = x;
       cy = y;
     }

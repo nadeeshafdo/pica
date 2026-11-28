@@ -2,10 +2,32 @@ import { describe, expect, test, afterAll } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { captureFrames, closeBrowser, findChromeBinary, getRenderedBboxesAtTime, screenshotAtTime } from "../src/chromium.js";
-import { extractKeyframesBody, resolveSafePath } from "../src/pica-file.js";
+import {
+  captureFrames,
+  closeBrowser,
+  findChromeBinary,
+  getRenderedBboxesAtTime,
+  isAllowedRequestUrl,
+  screenshotAtTime,
+  screenshotInspectSinglePass,
+} from "../src/chromium.js";
+import {
+  assertBalancedBraces,
+  extractKeyframesBody,
+  isSafeDataUrl,
+  normalizeCssForCheck,
+  resolveSafePath,
+} from "../src/pica-file.js";
 import { normalizeFontAliases, renderPixels, renderPngBuffer } from "../src/render.js";
-import { handleAnimate, handleCreate, handleExport, handleInspect, handlePatch, handleRead } from "../src/tools.js";
+import {
+  handleAnimate,
+  handleConfigure,
+  handleCreate,
+  handleExport,
+  handleInspect,
+  handlePatch,
+  handleRead,
+} from "../src/tools.js";
 import { isAllowedOrigin, setCurrentSvg, startPreviewServer } from "../src/preview.js";
 
 function ffmpegAvailable(): boolean {
@@ -222,8 +244,8 @@ describe("fast geometry", () => {
       expect(byId.get("p2")?.bbox).toEqual({ x: 10, y: 10, w: 20, h: 20 });
       // cubic/smooth quad chain incl. control points: min 0,0 max 60,30
       expect(byId.get("p3")?.bbox).toEqual({ x: 0, y: 0, w: 60, h: 30 });
-      // arc endpoints
-      expect(byId.get("p4")?.bbox).toEqual({ x: 0, y: 0, w: 20, h: 0 });
+      // arc endpoints plus conservative radius bounds
+      expect(byId.get("p4")?.bbox).toEqual({ x: 0, y: -10, w: 20, h: 20 });
       // group union of children
       expect(byId.get("grp")?.bbox).toEqual({ x: 5, y: 5, w: 125, h: 235 });
       // centered text: w = 0.6*20*2 = 24
@@ -923,7 +945,7 @@ describe("audit regressions", () => {
         animations: [{ id: "r1" }],
       });
       expect(badKeyframesUrl.isError).toBe(true);
-      expect(textOf(badKeyframesUrl as never)).toMatch(/dangerous CSS/i);
+      expect(textOf(badKeyframesUrl as never)).toMatch(/unsupported CSS/i);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -977,6 +999,463 @@ describe("audit regressions", () => {
       }
       if (oldPort === undefined) delete process.env["PICA_PORT"];
       else process.env["PICA_PORT"] = oldPort;
+    }
+  }, 60000);
+});
+
+describe("canonical path handling", () => {
+  test("resolves inside root, rejects outside, handles new files and symlinks", async () => {
+    const { mkdtemp: mkd, rm: rmf, mkdir, symlink, writeFile } = await import("node:fs/promises");
+    const { existsSync } = await import("node:fs");
+    const root = await mkd(join(tmpdir(), "pica-canon-"));
+    const old = process.env["PICA_ROOT"];
+    try {
+      process.env["PICA_ROOT"] = root;
+      // existing file inside passes
+      const inside = join(root, "a.pica.svg");
+      expect((await handleCreate({ path: inside, width: 100, height: 100 })).isError).toBeFalsy();
+      // new nested file (ancestors missing) passes via walk-up
+      const nested = join(root, "sub", "dir", "new.pica.svg");
+      expect((await handleCreate({ path: nested, width: 10, height: 10 })).isError).toBeFalsy();
+      expect(existsSync(nested)).toBe(true);
+      // outside via .. is rejected
+      const outside = join(root, "..", `escape-${Date.now()}.pica.svg`);
+      const rej = await handleCreate({ path: outside, width: 10, height: 10 });
+      expect(rej.isError).toBe(true);
+      expect(textOf(rej as never)).toMatch(/escapes PICA_ROOT/i);
+      // symlink inside pointing outside is rejected after canonicalization
+      const realOutside = await mkd(join(tmpdir(), "pica-real-"));
+      try {
+        const linkPath = join(root, "linkdir");
+        await symlink(realOutside, linkPath);
+        const viaLink = join(linkPath, "via.pica.svg");
+        const rej2 = await handleCreate({ path: viaLink, width: 10, height: 10 });
+        expect(rej2.isError).toBe(true);
+        expect(textOf(rej2 as never)).toMatch(/escapes PICA_ROOT/i);
+      } finally {
+        await rmf(realOutside, { recursive: true, force: true });
+      }
+    } finally {
+      if (old === undefined) delete process.env["PICA_ROOT"];
+      else process.env["PICA_ROOT"] = old;
+      await rmf(root, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+describe("css normalization and keyframes", () => {
+  test("strips comments and decodes hex escapes before checks", () => {
+    expect(normalizeCssForCheck("/* @import url(x) */ .a{color:red}")).not.toMatch(/@import/);
+    // \40 is @, \75 is u so \75rl( decodes to url(
+    expect(normalizeCssForCheck("\\40import")).toContain("@import");
+    expect(normalizeCssForCheck("a\\75rl(http://x)").toLowerCase()).toContain("url(");
+    expect(normalizeCssForCheck("a/*x*/b")).toBe("ab");
+  });
+
+  test("balanced braces accept strings, reject unbalanced", () => {
+    expect(() => assertBalancedBraces("0%{opacity:0}100%{opacity:1}")).not.toThrow();
+    expect(() => assertBalancedBraces('0%{content:"}"}100%{opacity:1}')).not.toThrow();
+    expect(() => assertBalancedBraces("0%{content:'}'}")).not.toThrow();
+    expect(() => assertBalancedBraces("0%{opacity:0")).toThrow();
+    expect(() => assertBalancedBraces("0%{opacity:0}}")).toThrow();
+    expect(() => assertBalancedBraces("}{")).toThrow();
+  });
+
+  test("pica_animate rejects encoded url and unbalanced braces", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-css-"));
+    try {
+      const path = join(dir, "c.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      expect(
+        (
+          await handlePatch({
+            path,
+            ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 0, y: 0, width: 5, height: 5 } }],
+          })
+        ).isError,
+      ).toBeFalsy();
+      // hex-encoded url( -> \75rl(
+      const encoded = await handleAnimate({
+        path,
+        name: "encBg",
+        keyframes: "0%{background-image:a\\75rl(http://evil/x.png)}100%{opacity:1}",
+        animations: [{ id: "r1" }],
+      });
+      expect(encoded.isError).toBe(true);
+      // comment-wrapped token is still plain text after strip, but direct @import is rejected
+      const commented = await handleAnimate({
+        path,
+        name: "impTest",
+        keyframes: "0%{opacity:0}100%{opacity:1}/* @import */",
+        animations: [{ id: "r1" }],
+      });
+      // comment alone does not trigger token check; creation succeeds
+      expect(commented.isError).toBeFalsy();
+      const unbalanced = await handleAnimate({
+        path,
+        name: "unbal",
+        keyframes: "0%{opacity:0",
+        animations: [{ id: "r1" }],
+      });
+      expect(unbalanced.isError).toBe(true);
+      expect(textOf(unbalanced as never)).toMatch(/unbalanced/i);
+      const extraClose = await handleAnimate({
+        path,
+        name: "extra",
+        keyframes: "0%{opacity:0}}",
+        animations: [{ id: "r1" }],
+      });
+      expect(extraClose.isError).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("pica_patch add rejects style elements, setDefs rejects non-pica-anim style", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-style-"));
+    try {
+      const path = join(dir, "s.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      const addStyle = await handlePatch({
+        path,
+        ops: [{ op: "add", id: "s1", tag: "style", attrs: {}, textContent: ".a{fill:red}" }],
+      });
+      expect(addStyle.isError).toBe(true);
+      expect(textOf(addStyle as never)).toMatch(/style/i);
+      const defsStyle = await handlePatch({
+        path,
+        ops: [{ op: "setDefs", defsSvg: `<style>.a{fill:red}</style>` }],
+      });
+      expect(defsStyle.isError).toBe(true);
+      expect(textOf(defsStyle as never)).toMatch(/pica-anim/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+describe("data url allowlist", () => {
+  test("isSafeDataUrl and isAllowedRequestUrl accept listed prefixes only", () => {
+    for (const ok of [
+      "data:image/png;base64,aaa",
+      "data:image/jpeg;base64,aaa",
+      "data:image/webp;base64,aaa",
+      "data:image/gif;base64,aaa",
+      "data:font/woff2;base64,aaa",
+      "data:application/font-woff;base64,aaa",
+      "data:application/font-woff2;base64,aaa",
+    ]) {
+      expect(isSafeDataUrl(ok)).toBe(true);
+      expect(isAllowedRequestUrl(ok)).toBe(true);
+    }
+    for (const bad of [
+      "data:image/svg+xml,<svg/>",
+      "data:application/xhtml+xml,<html/>",
+      "data:text/html,<h1>hi</h1>",
+      "data:text/plain,hello",
+      "data:application/json,{}",
+    ]) {
+      expect(isSafeDataUrl(bad)).toBe(false);
+      expect(isAllowedRequestUrl(bad)).toBe(false);
+    }
+    expect(isAllowedRequestUrl("about:blank")).toBe(true);
+    expect(isAllowedRequestUrl("http://127.0.0.1:1/x.png")).toBe(false);
+  });
+
+  test("pica_patch defs accept png data uri, reject svg data uri", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-data-"));
+    try {
+      const path = join(dir, "d.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      const okDefs = await handlePatch({
+        path,
+        ops: [
+          {
+            op: "setDefs",
+            defsSvg: `<image id="i1" href="data:image/png;base64,iVBORw0KGgo=" width="10" height="10" />`,
+          },
+        ],
+      });
+      expect(okDefs.isError).toBeFalsy();
+      const badDefs = await handlePatch({
+        path,
+        ops: [
+          {
+            op: "setDefs",
+            defsSvg: `<image id="i2" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>" width="10" height="10" />`,
+          },
+        ],
+      });
+      expect(badDefs.isError).toBe(true);
+      expect(textOf(badDefs as never)).toMatch(/data:/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+describe("canvas configuration", () => {
+  test("pica_configure updates dims, background, fps and duration", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-cfg-"));
+    try {
+      const path = join(dir, "c.pica.svg");
+      expect((await handleCreate({ path, width: 800, height: 600, durationMs: 2000 })).isError).toBeFalsy();
+      expect(
+        (
+          await handlePatch({
+            path,
+            ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 0, y: 0, width: 10, height: 10 } }],
+          })
+        ).isError,
+      ).toBeFalsy();
+      expect(
+        (
+          await handleAnimate({
+            path,
+            name: "long",
+            keyframes: "0%{opacity:0}100%{opacity:1}",
+            animations: [{ id: "r1", durationMs: 5000 }],
+          })
+        ).isError,
+      ).toBeFalsy();
+      const cfg = await handleConfigure({ path, width: 400, height: 300, background: "#112233", fps: 24, durationMs: 1000 });
+      expect(cfg.isError).toBeFalsy();
+      const read = await handleRead({ path, bboxMode: "fast" });
+      const j = JSON.parse(textOf(read as never)) as {
+        width: number;
+        height: number;
+        meta: { background: string; fps: number; durationMs: number; baseDurationMs?: number };
+      };
+      expect(j.width).toBe(400);
+      expect(j.height).toBe(300);
+      expect(j.meta.background).toBe("#112233");
+      expect(j.meta.fps).toBe(24);
+      expect(j.meta.baseDurationMs).toBe(1000);
+      // longest animation is 5000ms, so recalculated duration stays 5000
+      expect(j.meta.durationMs).toBe(5000);
+      const raw = await Bun.file(path).text();
+      expect(raw).toContain('viewBox="0 0 400 300"');
+      expect(raw).toContain('fill="#112233"');
+      // reducing after removing animation shortens timeline
+      expect((await handleAnimate({ path, name: "long", remove: true })).isError).toBeFalsy();
+      const cfg2 = await handleConfigure({ path, durationMs: 500 });
+      expect(cfg2.isError).toBeFalsy();
+      const read2 = await handleRead({ path, bboxMode: "fast" });
+      const j2 = JSON.parse(textOf(read2 as never)) as { meta: { durationMs: number; baseDurationMs?: number } };
+      expect(j2.meta.durationMs).toBe(500);
+      expect(j2.meta.baseDurationMs).toBe(500);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("pica_patch bg fill syncs metadata background", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-bgsync-"));
+    try {
+      const path = join(dir, "b.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200, background: "#ffffff" })).isError).toBeFalsy();
+      expect(
+        (await handlePatch({ path, ops: [{ op: "update", id: "pica-bg", attrs: { fill: "#aabbcc" } }] })).isError,
+      ).toBeFalsy();
+      const read = await handleRead({ path, bboxMode: "fast" });
+      const j = JSON.parse(textOf(read as never)) as { meta: { background: string } };
+      expect(j.meta.background).toBe("#aabbcc");
+      const raw = await Bun.file(path).text();
+      expect(raw).toContain('fill="#aabbcc"');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+describe("geometry and render polish", () => {
+  test("arc bboxes keep radius bounds on flat chords", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-arc-"));
+    try {
+      const path = join(dir, "arc.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      expect(
+        (
+          await handlePatch({
+            path,
+            ops: [
+              { op: "add", id: "flat", tag: "path", attrs: { d: "M0 0 A10 10 0 0 1 20 0" } },
+              { op: "add", id: "vert", tag: "path", attrs: { d: "M0 0 A10 10 0 0 1 0 20" } },
+            ],
+          })
+        ).isError,
+      ).toBeFalsy();
+      const read = await handleRead({ path, bboxMode: "fast" });
+      const j = JSON.parse(textOf(read as never)) as {
+        nodes: Array<{ id: string; bbox: { x: number; y: number; w: number; h: number } }>;
+      };
+      const flat = j.nodes.find((n) => n.id === "flat");
+      expect(flat).toBeDefined();
+      expect(flat?.bbox.w).toBeGreaterThan(0);
+      expect(flat?.bbox.h).toBeGreaterThan(0);
+      expect(flat?.bbox).toEqual({ x: 0, y: -10, w: 20, h: 20 });
+      const vert = j.nodes.find((n) => n.id === "vert");
+      expect(vert?.bbox.w).toBeGreaterThan(0);
+      expect(vert?.bbox.h).toBeGreaterThan(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("namespaced text triggers font path", () => {
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" xmlns:svg="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">` +
+      `<rect width="200" height="100" fill="#111113"/>` +
+      `<svg:text x="100" y="65" font-size="40" text-anchor="middle" fill="#f5f5f0" font-family="Inter, system-ui, sans-serif">pica</svg:text>` +
+      `</svg>`;
+    const { pixels, width, height } = renderPixels(svg, 1);
+    expect(width).toBe(200);
+    expect(height).toBe(100);
+    let bright = 0;
+    for (let i = 0; i < pixels.length; i += 4) {
+      const r = pixels[i] as number;
+      if (r > 150) bright++;
+    }
+    expect(bright).toBeGreaterThan(200);
+  });
+
+  test("single-pass inspect renders grid and ids via chromium when available", async () => {
+    if (!findChromeBinary()) {
+      console.error("skip single-pass test: chromium missing");
+      return;
+    }
+    const dir = await mkdtemp(join(tmpdir(), "pica-single-"));
+    try {
+      const path = join(dir, "s.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 150 })).isError).toBeFalsy();
+      expect(
+        (
+          await handlePatch({
+            path,
+            ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 10, y: 10, width: 40, height: 30, fill: "red" } }],
+          })
+        ).isError,
+      ).toBeFalsy();
+      expect(
+        (
+          await handleAnimate({
+            path,
+            name: "fadeUp",
+            keyframes: "0%{opacity:0}100%{opacity:1}",
+            animations: [{ id: "r1", durationMs: 1000 }],
+          })
+        ).isError,
+      ).toBeFalsy();
+      const raw = await Bun.file(path).text();
+      const { stripDebugOverlay } = await import("../src/pica-file.js");
+      const clean = stripDebugOverlay(raw);
+      const png = await screenshotInspectSinglePass(clean, 200, 150, 500, 1, true, true);
+      expect(png.length).toBeGreaterThan(500);
+      const insp = await handleInspect({ path, timeMs: 500, showGrid: true, showIds: true, scale: 1 });
+      expect(insp.isError).toBeFalsy();
+      const blk = insp.content[0] as { type: string; mimeType: string; data: string };
+      expect(blk.type).toBe("image");
+      expect(blk.data.length).toBeGreaterThan(500);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 120000);
+});
+
+describe("comment and data url edge cases", () => {
+  test("unclosed css comment is rejected in keyframes", async () => {
+    expect(() => assertBalancedBraces("0%{opacity:0} /* unclosed")).toThrow(/unclosed comment/i);
+    expect(() => assertBalancedBraces("0%{opacity:0} */")).toThrow(/unclosed comment/i);
+    expect(() => assertBalancedBraces("0%{opacity:0}/* ok */100%{opacity:1}")).not.toThrow();
+    const dir = await mkdtemp(join(tmpdir(), "pica-comment-"));
+    try {
+      const path = join(dir, "c.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      expect(
+        (
+          await handlePatch({
+            path,
+            ops: [{ op: "add", id: "r1", tag: "rect", attrs: { x: 0, y: 0, width: 5, height: 5 } }],
+          })
+        ).isError,
+      ).toBeFalsy();
+      const res = await handleAnimate({
+        path,
+        name: "withComment",
+        keyframes: "0%{opacity:0} /* unclosed",
+        animations: [{ id: "r1" }],
+      });
+      expect(res.isError).toBe(true);
+      expect(textOf(res as never)).toMatch(/unclosed comment/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("url wrapped svg data uri is rejected in attributes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pica-urldata-"));
+    try {
+      const path = join(dir, "u.pica.svg");
+      expect((await handleCreate({ path, width: 200, height: 200 })).isError).toBeFalsy();
+      const bad = await handlePatch({
+        path,
+        ops: [
+          {
+            op: "add",
+            id: "r1",
+            tag: "rect",
+            attrs: { x: 0, y: 0, width: 10, height: 10, fill: "url(data:image/svg+xml;base64,PHN2Zz4=)" },
+          },
+        ],
+      });
+      expect(bad.isError).toBe(true);
+      expect(textOf(bad as never)).toMatch(/data:/i);
+      const badHref = await handlePatch({
+        path,
+        ops: [
+          {
+            op: "add",
+            id: "i1",
+            tag: "image",
+            attrs: { href: "url(data:image/svg+xml,<svg/>)" },
+          },
+        ],
+      });
+      expect(badHref.isError).toBe(true);
+      const ok = await handlePatch({
+        path,
+        ops: [
+          {
+            op: "add",
+            id: "ok1",
+            tag: "rect",
+            attrs: { x: 0, y: 0, width: 10, height: 10, fill: "red" },
+          },
+        ],
+      });
+      expect(ok.isError).toBeFalsy();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("dangling symlink under root is resolved and rejected when outside", async () => {
+    const { symlink } = await import("node:fs/promises");
+    const root = await mkdtemp(join(tmpdir(), "pica-dangle-"));
+    const old = process.env["PICA_ROOT"];
+    try {
+      process.env["PICA_ROOT"] = root;
+      const missingTarget = join(tmpdir(), `pica-missing-${Date.now()}`);
+      const linkPath = join(root, "dangling");
+      await symlink(missingTarget, linkPath);
+      const via = join(linkPath, "inner.pica.svg");
+      const res = await handleCreate({ path: via, width: 10, height: 10 });
+      expect(res.isError).toBe(true);
+      expect(textOf(res as never)).toMatch(/escapes PICA_ROOT/i);
+    } finally {
+      if (old === undefined) delete process.env["PICA_ROOT"];
+      else process.env["PICA_ROOT"] = old;
+      await rm(root, { recursive: true, force: true });
     }
   }, 60000);
 });

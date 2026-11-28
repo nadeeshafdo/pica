@@ -8,7 +8,7 @@ Every canvas is a standard, standalone `.pica.svg` file. Agents mutate it cleanl
 
 ## Demo
 
-![pica demo](assets/demo.webp)
+![pica demo](https://raw.githubusercontent.com/nadeeshafdo/pica/main/assets/demo.webp)
 
 Opening hook from the pica launch ad, a 64 second spot authored as `.pica.svg` and exported with `pica_export`.
 
@@ -38,7 +38,7 @@ Coding Agent (OpenCode / Claude Code / MCP Client)
 
 - **Zero heavy JS media deps:** No Playwright, Puppeteer, Sharp, Canvas, React, or Vite.
 - **Pure stdio protocol:** All logs route to `stderr` so `stdout` stays clean JSON-RPC.
-- **Deterministic animation capture:** Headless Chromium pauses `document.getAnimations()`, steps exact integer frame timestamps, and pipes raw PNG frames straight into `ffmpeg` stdin.
+- **Deterministic animation capture:** Headless Chromium pauses `document.getAnimations()`, steps exact frame timestamps, and pipes raw PNG frames straight into `ffmpeg` stdin.
 
 ## Prerequisites
 
@@ -162,6 +162,16 @@ Adds, updates, or removes `@keyframes` and `#id` animation rules inside `<style 
 - `animations` (array, optional): Target bindings `{ id, durationMs?, delayMs?, easing?, iterations?, direction?, fill?, transformOrigin? }`.
 - `remove` (boolean, default `false`): Delete the `@keyframes` block and surgically remove only matching entries from comma-separated `animation:` declarations.
 
+### `pica_configure`
+Updates canvas-level properties on an existing `.pica.svg` file and notifies live preview clients.
+
+- `path` (string, required): Target `.pica.svg` file path.
+- `width` (int, optional): Canvas width in pixels.
+- `height` (int, optional): Canvas height in pixels.
+- `background` (string, optional): Canvas background CSS color (syncs `#pica-bg` and `#pica-meta`).
+- `fps` (number, optional): Frames per second for animated exports.
+- `durationMs` (int, optional): Timeline duration in milliseconds. Sets `baseDurationMs` and recalculates `durationMs`.
+
 ### `pica_inspect`
 Renders a PNG preview and returns an MCP image block plus a short text summary for visual verification.
 
@@ -205,7 +215,7 @@ All disk writes are atomic (`.tmp` write followed by rename). Because the source
 When the MCP server starts, it opens an optional local preview server at `http://127.0.0.1:4173` (port failures log to `stderr` and never crash the MCP transport). If `PICA_PORT` is busy, it automatically falls back to an OS-assigned ephemeral port on `127.0.0.1` and logs the actual URL.
 
 - Checkerboard artboard with wheel zoom, drag pan, and fit-to-screen.
-- Live WebSocket reload on every `pica_create`, `pica_patch`, and `pica_animate` while preserving your current zoom and pan across patches. `/ws` upgrades require same-origin (`127.0.0.1` / `localhost`) or missing `Origin`.
+- Live WebSocket reload on every `pica_create`, `pica_patch`, `pica_animate`, and `pica_configure` while preserving your current zoom and pan across patches. `/ws` upgrades require same-origin (`127.0.0.1` / `localhost`) or missing `Origin`.
 - Bottom timeline scrubber (Play/Pause + time slider) synced with `document.getAnimations()`.
 
 ## Environment Variables
@@ -215,6 +225,7 @@ When the MCP server starts, it opens an optional local preview server at `http:/
 | `PICA_PORT` | `4173` | Port for the local Hono live preview server (`127.0.0.1`). Falls back to ephemeral `0` when busy. |
 | `PICA_ROOT` | Unset | When set, all `path` / `outPath` inputs must resolve inside this directory tree. |
 | `CHROME_PATH` / `CHROMIUM_PATH` | Auto-detected | Explicit path to a Chromium or Google Chrome executable. |
+| `PICA_CHROME_NO_SANDBOX` | Unset | Set to `1` to launch Chromium with `--no-sandbox`. By default the sandbox is kept and only retried without it when the first launch does not start. |
 
 ## Development
 

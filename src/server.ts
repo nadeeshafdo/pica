@@ -1,12 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import {
   AnimateSchema,
+  ConfigureSchema,
   CreateSchema,
   ExportSchema,
   InspectSchema,
   PatchSchema,
   ReadSchema,
   handleAnimate,
+  handleConfigure,
   handleCreate,
   handleExport,
   handleInspect,
@@ -15,7 +17,7 @@ import {
 } from "./tools.js";
 
 export function createServer(): McpServer {
-  const server = new McpServer({ name: "pica", version: "0.1.0" });
+  const server = new McpServer({ name: "pica", version: "0.1.1" });
 
   server.registerTool(
     "pica_create",
@@ -55,6 +57,16 @@ export function createServer(): McpServer {
       inputSchema: AnimateSchema,
     },
     async (args) => handleAnimate(args),
+  );
+
+  server.registerTool(
+    "pica_configure",
+    {
+      title: "Configure canvas",
+      description: "Update canvas-level properties (width, height, background, fps, durationMs) on an existing .pica.svg. Updates svg dimensions, background fill, and metadata atomically.",
+      inputSchema: ConfigureSchema,
+    },
+    async (args) => handleConfigure(args),
   );
 
   server.registerTool(

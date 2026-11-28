@@ -56,12 +56,13 @@ Out of scope (but still welcome as regular bugs):
 
 Hardening already in place:
 
-- DOM-based SVG sanitization via `linkedom`: rejects `<script>`, `<foreignObject>`, `<iframe>`, `<object>`, `<embed>`, and `<applet>`; `on*` handlers including no-space bypasses; entity-decoded `javascript:`, `vbscript:`, and `data:text/html` URLs; and dangerous `<style>` CSS (`@import`, `javascript:`, `expression(`).
+- DOM-based SVG sanitization via `linkedom`: rejects `<script>`, `<foreignObject>`, `<iframe>`, `<object>`, `<embed>`, and `<applet>`; `on*` handlers including no-space forms; entity-decoded `javascript:`, `vbscript:`, and limited `data:` URLs (allowlist: `data:image/png`, `data:image/jpeg`, `data:image/webp`, `data:image/gif`, `data:font/`, `data:application/font-woff`, `data:application/font-woff2`); and `<style>` CSS with `@import`, `javascript:`, `expression(`, or `url(` after comment and hex-escape normalization. Only `<style id="pica-anim">` is accepted.
 - Skeleton element protection: `pica-meta`, `pica-defs`, `pica-anim`, and `pica-root` are blocked from `update`, `remove`, and `reorder`; `pica-bg` is restricted to `fill`, `opacity`, and `fill-opacity`; `id` mutation is blocked on all elements.
-- `pica_animate` CSS injection guards on keyframe names, keyframe bodies (including `url(`), and target properties (`easing`, `transformOrigin`, `direction`, `fill`, string `iterations`).
-- Path safety via `resolveSafePath` (null-byte rejection and optional `PICA_ROOT` sandbox jail) plus `ffmpeg` flag (`-...`) and protocol (`://`) rejection on the raw `outPath`.
-- Headless Chromium CDP `Fetch.enable` request blocking: external `http://`, `https://`, `file://`, and `ws://` requests are blocked, allowing only `about:blank` and non-HTML `data:` URLs.
-- Preview server bound to `127.0.0.1`, `/ws` `Origin` header validation (`403` on cross-origin), strict `DOMParser` SVG parsing with no `innerHTML` fallback, and `Content-Security-Policy` headers on `/` and `/svg`.
+- `pica_animate` CSS checks on keyframe names, keyframe bodies (including `url(`, balanced-brace validation, comment and hex-escape normalization), and target properties (`easing`, `transformOrigin`, `direction`, `fill`, string `iterations`).
+- `pica_configure` updates `width`, `height`, `viewBox`, `#pica-bg` fill, and `#pica-meta` (`fps`, `background`, `baseDurationMs`, recalculated `durationMs`) atomically; `pica_patch` keeps `#pica-meta.background` in sync when `#pica-bg` fill changes.
+- Path handling via `resolveSafePath` (null-byte rejection and optional `PICA_ROOT` check with `realpathSync` canonicalization, walking to the nearest existing ancestor for new files) plus `ffmpeg` flag (`-...`) and protocol (`://`) rejection on the raw `outPath`.
+- Headless Chromium CDP `Fetch.enable` request handling: external `http://`, `https://`, `file://`, and `ws://` requests are not allowed, allowing only `about:blank` and the same `data:` allowlist as above. Chromium launches with the sandbox by default; set `PICA_CHROME_NO_SANDBOX=1` to include `--no-sandbox`, with a single retry without it when the first launch does not start.
+- Preview server bound to `127.0.0.1`, `/ws` `Origin` header validation (`403` on cross-origin), `DOMParser` SVG parsing for metadata with canvas rendering isolated in a sandboxed `<iframe sandbox="allow-same-origin" srcdoc>`, and `Content-Security-Policy` headers on `/` (`frame-src 'self'`, `font-src`) and `/svg`.
 - Atomic `.tmp` plus `rename` writes with failed-write `.tmp` cleanup, so interrupted writes never leave partial files.
 - Exports strip debug overlays (`showGrid`, `showIds` never persist).
 - No cloud calls, no telemetry, no bundled secrets.

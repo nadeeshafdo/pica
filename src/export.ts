@@ -70,11 +70,11 @@ async function runFfmpegWithPngInput(args: string[], png: Buffer, outPath: strin
     }
     const sink = writer as unknown as {
       write(c: Uint8Array): void | Promise<void>;
-      flush(): void;
+      flush(): void | Promise<void>;
       end(): void;
     };
     await sink.write(png);
-    sink.flush();
+    await sink.flush();
     sink.end();
     const exit = await proc.exited;
     const errText = await stderrPromise;
@@ -247,7 +247,7 @@ export async function exportAnimated(
   const stderrPromise = drainStderr(proc);
   const writer = proc.stdin as unknown as {
     write(c: Uint8Array): void | Promise<void>;
-    flush(): void;
+    flush(): void | Promise<void>;
     end(): void;
   } | null;
   if (!writer) {
@@ -262,7 +262,7 @@ export async function exportAnimated(
   try {
     await captureFrames(svgText, width, height, durationMs, fps, scale, async (png) => {
       await writer.write(png);
-      writer.flush();
+      await writer.flush();
     });
     writer.end();
     const exit = await proc.exited;
