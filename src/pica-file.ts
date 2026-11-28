@@ -1,5 +1,6 @@
 import { DOMParser } from "linkedom";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fastBbox, unionBboxes } from "./bbox.js";
 
 export const SVG_NS = "http://www.w3.org/2000/svg";
@@ -233,17 +234,52 @@ export function resolveSafePath(inputPath: string): string {
   }
   const resolved = resolve(inputPath);
   const rootRaw = process.env["PICA_ROOT"];
-  if (rootRaw && rootRaw.length > 0) {
-    if (rootRaw.includes("\0")) {
-      throw new Error("Rejected: PICA_ROOT contains null bytes.");
-    }
-    const root = resolve(rootRaw);
-    const rel = relative(root, resolved);
-    if (rel === ".." || rel.startsWith(`..${sep}`) || rel.startsWith("../") || isAbsolute(rel)) {
-      throw new Error(`Rejected: path escapes PICA_ROOT (${root}).`);
-    }
+  if (!rootRaw || rootRaw.length === 0) return resolved;
+  if (rootRaw.includes("\0")) {
+    throw new Error("Rejected: PICA_ROOT contains null bytes.");
   }
-  return resolved;
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = realpathSync(resolve(rootRaw));
+  } catch {
+    throw new Error(`Rejected: path escapes PICA_ROOT (${resolve(rootRaw)}).`);
+  }
+  // Target files may not exist yet (create/export). Walk up to the nearest
+  // existing ancestor, canonicalize it, then rejoin the remaining segments.
+  // Dangling symlinks are resolved via their link target instead of being
+  // treated as ordinary missing paths.
+  let ancestor = resolved;
+  const rest: string[] = [];
+  const seenLinks = new Set<string>();
+  while (!existsSync(ancestor)) {
+    try {
+      const st = lstatSync(ancestor);
+      if (st.isSymbolicLink() && !seenLinks.has(ancestor)) {
+        seenLinks.add(ancestor);
+        const target = readlinkSync(ancestor);
+        ancestor = resolve(dirname(ancestor), target);
+        continue;
+      }
+    } catch {
+      // Not a symlink or cannot stat: treat as missing and walk up.
+    }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break;
+    rest.unshift(basename(ancestor));
+    ancestor = parent;
+  }
+  let canonicalAncestor: string;
+  try {
+    canonicalAncestor = realpathSync(ancestor);
+  } catch {
+    throw new Error(`Rejected: path escapes PICA_ROOT (${canonicalRoot}).`);
+  }
+  const canonicalTarget = rest.length > 0 ? join(canonicalAncestor, ...rest) : canonicalAncestor;
+  const rel = relative(canonicalRoot, canonicalTarget);
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || rel.startsWith("../") || isAbsolute(rel)) {
+    throw new Error(`Rejected: path escapes PICA_ROOT (${canonicalRoot}).`);
+  }
+  return canonicalTarget;
 }
 
 const FORBIDDEN_TAG_SET = new Set(["script", "foreignobject", "iframe", "object", "embed", "applet"]);
@@ -268,10 +304,92 @@ export function cleanUrlValue(value: string): string {
   return value.replace(/[\x00-\x20\x7F]+/g, "").toLowerCase();
 }
 
+const SAFE_DATA_PREFIXES = [
+  "data:image/png",
+  "data:image/jpeg",
+  "data:image/webp",
+  "data:image/gif",
+  "data:font/",
+  "data:application/font-woff",
+  "data:application/font-woff2",
+];
+
+export function isSafeDataUrl(cleanedLower: string): boolean {
+  return SAFE_DATA_PREFIXES.some((p) => cleanedLower.startsWith(p));
+}
+
+export function normalizeCssForCheck(css: string): string {
+  let out = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  out = out.replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_m, hex: string) => {
+    const code = Number.parseInt(hex, 16);
+    if (!Number.isFinite(code)) return "";
+    try {
+      return String.fromCodePoint(code);
+    } catch {
+      return "";
+    }
+  });
+  out = out.replace(/\\(.)/gs, "$1");
+  return out;
+}
+
+export function assertBalancedBraces(body: string): void {
+  const withoutComments = body.replace(/\/\*[\s\S]*?\*\//g, "");
+  if (withoutComments.includes("/*") || withoutComments.includes("*/")) {
+    throw new Error("Rejected: unclosed comment in keyframes.");
+  }
+  const stripped = withoutComments;
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < stripped.length; i++) {
+    const ch = stripped[i] as string;
+    if (inSingle) {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      continue;
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth < 0) throw new Error("Rejected: unbalanced braces in keyframes.");
+    }
+  }
+  if (inSingle || inDouble) throw new Error("Rejected: unbalanced braces in keyframes.");
+  if (depth !== 0) throw new Error("Rejected: unbalanced braces in keyframes.");
+}
+
 export function assertSafeAttrValue(_attrName: string, value: string): void {
   const cleaned = cleanUrlValue(value);
-  if (cleaned.includes("javascript:") || cleaned.includes("vbscript:") || cleaned.includes("data:text/html")) {
+  if (cleaned.includes("javascript:") || cleaned.includes("vbscript:")) {
     throw new Error(`Rejected: dangerous URL in attribute '${_attrName}'.`);
+  }
+  const dataUrls = cleaned.match(/data:[^)\s"'<>]*/g);
+  if (dataUrls) {
+    for (const m of dataUrls) {
+      if (!isSafeDataUrl(m)) {
+        throw new Error(`Rejected: unsupported data: URL in attribute '${_attrName}'.`);
+      }
+    }
   }
 }
 
@@ -307,9 +425,18 @@ export function assertSafeSvgTree(doc: Document): void {
       }
     }
     if (localTagName(String(tag)) === "style") {
-      const css = (el.textContent ?? "").toLowerCase();
-      if (css.includes("javascript:") || css.includes("expression(") || css.includes("@import")) {
-        throw new Error("Rejected: dangerous CSS in <style>.");
+      const sid = (el as unknown as { getAttribute?: (n: string) => string | null }).getAttribute?.("id") ?? null;
+      if (sid !== "pica-anim") {
+        throw new Error('Rejected: only <style id="pica-anim"> is allowed.');
+      }
+      const css = normalizeCssForCheck(el.textContent ?? "").toLowerCase();
+      if (
+        css.includes("javascript:") ||
+        css.includes("expression(") ||
+        css.includes("@import") ||
+        css.includes("url(")
+      ) {
+        throw new Error("Rejected: unsupported CSS in <style>.");
       }
     }
   }

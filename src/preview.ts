@@ -12,7 +12,7 @@ export function setCurrentSvg(path: string, text: string): void {
     try {
       c.send(msg);
     } catch {
-      // drop broken client lazily on close
+      // remove closed client lazily
     }
   }
 }
@@ -63,14 +63,14 @@ export function startPreviewServer(): null | ReturnType<typeof Bun.serve> {
     const html = await loadViewerHtml();
     c.header(
       "Content-Security-Policy",
-      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; object-src 'none'; frame-ancestors 'none'",
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; object-src 'none'; frame-src 'self'; frame-ancestors 'none'",
     );
     return c.html(html);
   });
   app.get("/svg", (c) => {
     c.header(
       "Content-Security-Policy",
-      "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox",
+      "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; sandbox",
     );
     if (!lastSvgText) {
       return c.text("No .pica.svg written yet in this session.", 404);

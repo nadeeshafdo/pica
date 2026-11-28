@@ -46,7 +46,7 @@ export function normalizeFontAliases(svgText: string): string {
 
 function buildResvg(svgText: string, scale: number): Resvg {
   const s = scale <= 0 || !Number.isFinite(scale) ? 1 : scale;
-  const withText = svgText.includes("<text");
+  const withText = /<(?:[A-Za-z_][\w.-]*:)?text\b/i.test(svgText);
   const input = withText ? normalizeFontAliases(svgText) : svgText;
   if (!withText) {
     return new Resvg(input, {

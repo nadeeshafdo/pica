@@ -1,7 +1,9 @@
 import { z } from "zod";
 import {
+  assertBalancedBraces,
   assertNoScript,
   assertSafeAttributesRecord,
+  assertSafeAttrValue,
   assertSafeDefsSvg,
   assertSafeSvgTree,
   assertWellFormedXml,
@@ -12,6 +14,7 @@ import {
   isForbiddenTag,
   loadXmlDoc,
   localAttrName,
+  normalizeCssForCheck,
   parseAnimationsList,
   parseDims,
   parseMeta,
@@ -29,6 +32,7 @@ import {
   getExactBboxes,
   getRenderedBboxesAtTime,
   screenshotAtTime,
+  screenshotInspectSinglePass,
 } from "./chromium.js";
 import {
   assertSafeFfmpegOutPath,
@@ -123,6 +127,16 @@ export const AnimateSchema = z.object({
   remove: z.boolean().default(false).describe("Remove the keyframes and referencing rules"),
 });
 export type AnimateInput = z.infer<typeof AnimateSchema>;
+
+export const ConfigureSchema = z.object({
+  path: z.string().min(1).describe("Target .pica.svg file path"),
+  width: z.number().int().positive().max(8192).optional().describe("Canvas width in px"),
+  height: z.number().int().positive().max(8192).optional().describe("Canvas height in px"),
+  background: z.string().optional().describe("Canvas background CSS color"),
+  fps: z.number().positive().max(120).optional().describe("Frames per second for animated exports"),
+  durationMs: z.number().int().positive().max(600000).optional().describe("Timeline duration in ms"),
+});
+export type ConfigureInput = z.infer<typeof ConfigureSchema>;
 
 export const InspectSchema = z.object({
   path: z.string().min(1).describe("Input .pica.svg file path"),
@@ -313,6 +327,10 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
 
     for (const op of input.ops) {
       if (op.op === "add") {
+        const localTag = op.tag.includes(":") ? (op.tag.split(":").pop() ?? op.tag).toLowerCase() : op.tag.toLowerCase();
+        if (localTag === "style") {
+          throw new Error('pica_patch add failed: <style> elements are managed by pica_animate.');
+        }
         sanitizeTag(op.tag);
         if (!ID_RE.test(op.id)) {
           throw new Error(
@@ -373,6 +391,20 @@ export async function handlePatch(input: z.input<typeof PatchSchema>): Promise<T
           for (const [k, v] of Object.entries(attrs)) {
             if (v === null) el.removeAttribute(k);
             else el.setAttribute(k, v);
+          }
+          if (Object.prototype.hasOwnProperty.call(attrs, "fill")) {
+            const fillVal = attrs["fill"];
+            if (typeof fillVal === "string") {
+              const metaEl = getElById(doc, "pica-meta");
+              if (metaEl?.textContent) {
+                try {
+                  const meta = parseMeta(doc);
+                  metaEl.textContent = JSON.stringify({ ...meta, background: fillVal });
+                } catch {
+                  // keep existing metadata on parse issues
+                }
+              }
+            }
           }
         } else {
           const attrs = sanitizeAttrs(op.attrs);
@@ -630,16 +662,16 @@ function upsertIdRule(css: string, id: string, animationValue: string, origin: s
 
 function assertSafeCssValue(field: string, value: string): void {
   if (/[{};<>]/.test(value)) {
-    throw new Error(`Rejected: dangerous CSS in '${field}'.`);
+    throw new Error(`Rejected: unsupported CSS in '${field}'.`);
   }
-  const lowered = value.toLowerCase();
+  const lowered = normalizeCssForCheck(value).toLowerCase();
   if (
     lowered.includes("@import") ||
     lowered.includes("javascript:") ||
     lowered.includes("expression(") ||
     lowered.includes("url(")
   ) {
-    throw new Error(`Rejected: dangerous CSS in '${field}'.`);
+    throw new Error(`Rejected: unsupported CSS in '${field}'.`);
   }
 }
 
@@ -710,14 +742,15 @@ export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promi
     }
     if (body) {
       assertNoScript(body);
-      const lowered = body.toLowerCase();
+      assertBalancedBraces(body);
+      const lowered = normalizeCssForCheck(body).toLowerCase();
       if (
         lowered.includes("javascript:") ||
         lowered.includes("expression(") ||
         lowered.includes("@import") ||
         lowered.includes("url(")
       ) {
-        throw new Error("Rejected: dangerous CSS in keyframes.");
+        throw new Error("Rejected: unsupported CSS in keyframes.");
       }
       css = removeKeyframesBlock(css, input.name);
       css = `${css}\n@keyframes ${input.name} { ${body} }`.trim();
@@ -751,6 +784,77 @@ export async function handleAnimate(input: z.input<typeof AnimateSchema>): Promi
     return okText({ ok: true, path: safePath, name: input.name, targets: (input.animations ?? []).map((t) => t.id) });
   } catch (e) {
     return errText(`pica_animate failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+export async function handleConfigure(input: z.input<typeof ConfigureSchema>): Promise<ToolResult> {
+  let safePath: string;
+  try {
+    safePath = resolveSafePath(input.path);
+  } catch (e) {
+    return errText(`pica_configure failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  let raw: string;
+  try {
+    raw = await Bun.file(safePath).text();
+  } catch {
+    return errText(`pica_configure failed: file not found: ${safePath}. Create it first with pica_create.`);
+  }
+  try {
+    assertNoScript(raw);
+    const doc = loadXmlDoc(raw);
+    ensurePicaSkeleton(doc);
+    const svg = doc.documentElement;
+    if (!svg) throw new Error("pica_configure failed: missing <svg> root.");
+    const current = parseDims(doc);
+    const meta = parseMeta(doc);
+    const styleEl = getElById(doc, "pica-anim");
+    const css = (styleEl?.textContent ?? "").trim();
+    const nextW = input.width ?? current.width;
+    const nextH = input.height ?? current.height;
+    if (input.width !== undefined) svg.setAttribute("width", String(nextW));
+    if (input.height !== undefined) svg.setAttribute("height", String(nextH));
+    if (input.width !== undefined || input.height !== undefined) {
+      svg.setAttribute("viewBox", `0 0 ${nextW} ${nextH}`);
+    }
+    if (input.background !== undefined) {
+      assertSafeAttrValue("fill", input.background);
+      const bg = getElById(doc, "pica-bg");
+      if (!bg) throw new Error("pica_configure failed: #pica-bg not found.");
+      bg.setAttribute("fill", input.background);
+    }
+    const metaEl = getElById(doc, "pica-meta");
+    if (!metaEl) throw new Error("pica_configure failed: #pica-meta not found.");
+    const nextFps = input.fps ?? meta.fps;
+    const nextBg = input.background ?? meta.background;
+    const nextBase = input.durationMs ?? meta.baseDurationMs ?? meta.durationMs;
+    const recalc = recalcDurationMs(css, nextBase);
+    metaEl.textContent = JSON.stringify({
+      ...meta,
+      fps: nextFps,
+      background: nextBg,
+      baseDurationMs: nextBase,
+      durationMs: recalc,
+    });
+    const out = serializeDoc(doc);
+    assertNoScript(out);
+    assertWellFormedXml(out);
+    assertSafeSvgTree(loadXmlDoc(out));
+    await atomicWriteFile(safePath, out);
+    setCurrentSvg(safePath, out);
+    const parsed = parsePica(out);
+    return okText({
+      ok: true,
+      path: safePath,
+      width: parsed.width,
+      height: parsed.height,
+      background: parsed.meta.background,
+      fps: parsed.meta.fps,
+      durationMs: parsed.meta.durationMs,
+      baseDurationMs: parsed.meta.baseDurationMs,
+    });
+  } catch (e) {
+    return errText(`pica_configure failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -806,33 +910,31 @@ export async function handleInspect(input: z.input<typeof InspectSchema>): Promi
       0.05,
       Math.min(requestedScale, maxWidth / Math.max(1, parsed.width)),
     );
-    let overlayNodes: Array<{ id: string; bbox: Bbox }> = parsed.nodesFlat;
-    if (showIds && findChromeBinary() && (animated || timeMs > 0 || /\btransform\s*[=:]/.test(clean))) {
-      try {
-        const exact = await getRenderedBboxesAtTime(clean, parsed.width, parsed.height, timeMs);
-        if (exact.length > 0) {
-          overlayNodes = exact;
-        }
-      } catch {
-        // fall back to fast bboxes
-      }
-    }
-    let svgForRender = clean;
-    if (showGrid || showIds) {
-      const overlay = buildDebugOverlay(parsed.width, parsed.height, overlayNodes, showGrid, showIds);
-      svgForRender = clean.replace(/<\/svg\s*>\s*$/i, `${overlay}</svg>`);
-    }
     let png: Buffer;
     let renderer = "resvg";
     let note = "";
     if (timeMs === 0 && !animated) {
+      let svgForRender = clean;
+      if (showGrid || showIds) {
+        const overlay = buildDebugOverlay(parsed.width, parsed.height, parsed.nodesFlat, showGrid, showIds);
+        svgForRender = clean.replace(/<\/svg\s*>\s*$/i, `${overlay}</svg>`);
+      }
       png = renderPngBuffer(svgForRender, effScale);
     } else if (findChromeBinary()) {
-      png = await screenshotAtTime(svgForRender, parsed.width, parsed.height, timeMs, effScale);
+      if (showGrid || showIds) {
+        png = await screenshotInspectSinglePass(clean, parsed.width, parsed.height, timeMs, effScale, showGrid, showIds);
+      } else {
+        png = await screenshotAtTime(clean, parsed.width, parsed.height, timeMs, effScale);
+      }
       renderer = "chromium-cdp";
     } else if (timeMs === 0) {
       // No Chromium: fall back to a static resvg render; CSS keyframes
       // (e.g. opacity:0 initial states) are not evaluated.
+      let svgForRender = clean;
+      if (showGrid || showIds) {
+        const overlay = buildDebugOverlay(parsed.width, parsed.height, parsed.nodesFlat, showGrid, showIds);
+        svgForRender = clean.replace(/<\/svg\s*>\s*$/i, `${overlay}</svg>`);
+      }
       png = renderPngBuffer(svgForRender, effScale);
       note = " (static fallback: CSS animations not evaluated, Chromium missing)";
     } else {

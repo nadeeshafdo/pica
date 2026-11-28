@@ -314,15 +314,24 @@ async function readBrowserEndpoint(proc: ReturnType<typeof Bun.spawn>): Promise<
       // ignore
     }
   }
-  throw new Error("Timed out waiting for Chromium DevTools endpoint. Is chromium installed and runnable with --no-sandbox?");
+  throw new Error("Timed out waiting for Chromium DevTools endpoint. Is chromium installed and runnable? If the sandbox is restricted, set PICA_CHROME_NO_SANDBOX=1.");
 }
 
-function isAllowedRequestUrl(url: string): boolean {
+const SAFE_DATA_PREFIXES = [
+  "data:image/png",
+  "data:image/jpeg",
+  "data:image/webp",
+  "data:image/gif",
+  "data:font/",
+  "data:application/font-woff",
+  "data:application/font-woff2",
+];
+
+export function isAllowedRequestUrl(url: string): boolean {
   if (url === "about:blank") return true;
-  const lower = url.toLowerCase();
+  const lower = url.toLowerCase().replace(/[\x00-\x20\x7F]+/g, "");
   if (lower.startsWith("data:")) {
-    if (lower.startsWith("data:text/html")) return false;
-    return true;
+    return SAFE_DATA_PREFIXES.some((p) => lower.startsWith(p));
   }
   return false;
 }
@@ -375,9 +384,8 @@ async function startBrowser(): Promise<void> {
     if (!bin) throw new Error(chromeMissingMessage());
     const userDir = await mkdtemp(join(tmpdir(), "pica-chrome-"));
     browserUserDir = userDir;
-    const args = [
+    const baseArgs = [
       "--headless",
-      "--no-sandbox",
       "--disable-gpu",
       "--disable-dev-shm-usage",
       "--hide-scrollbars",
@@ -386,33 +394,66 @@ async function startBrowser(): Promise<void> {
       `--user-data-dir=${userDir}`,
       "about:blank",
     ];
-    browserProc = Bun.spawn([bin, ...args], {
-      stdout: "ignore",
-      stderr: "pipe",
-      stdin: "ignore",
-    });
-    try {
-      const endpoint = await readBrowserEndpoint(browserProc);
-      browserConn = await CdpConn.connect(endpoint);
-      const created = (await browserConn.send("Target.createTarget", { url: "about:blank" })) as {
-        targetId?: string;
-      };
-      if (!created?.targetId) throw new Error("Chromium Target.createTarget did not return a targetId.");
-      pageTargetId = created.targetId;
-      const attached = (await browserConn.send("Target.attachToTarget", {
-        targetId: pageTargetId,
-        flatten: true,
-      })) as { sessionId?: string };
-      if (!attached?.sessionId) throw new Error("Chromium Target.attachToTarget did not return a sessionId.");
-      pageSessionId = attached.sessionId;
-      await browserConn.send("Page.enable", {}, pageSessionId);
-      await browserConn.send("Runtime.enable", {}, pageSessionId);
-      await enableFetchBlocking();
-      touchIdle();
-    } catch (e) {
-      await closeBrowser().catch(() => undefined);
-      throw e;
+    const envNoSandbox = process.env["PICA_CHROME_NO_SANDBOX"] === "1";
+    const withSandboxArgs = baseArgs;
+    const noSandboxArgs = ["--headless", "--no-sandbox", ...baseArgs.slice(1)];
+    const attempts = envNoSandbox ? [noSandboxArgs] : [withSandboxArgs, noSandboxArgs];
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < attempts.length; attempt++) {
+      const args = attempts[attempt] as string[];
+      browserProc = Bun.spawn([bin, ...args], {
+        stdout: "ignore",
+        stderr: "pipe",
+        stdin: "ignore",
+      });
+      try {
+        const endpoint = await readBrowserEndpoint(browserProc);
+        browserConn = await CdpConn.connect(endpoint);
+        const created = (await browserConn.send("Target.createTarget", { url: "about:blank" })) as {
+          targetId?: string;
+        };
+        if (!created?.targetId) throw new Error("Chromium Target.createTarget did not return a targetId.");
+        pageTargetId = created.targetId;
+        const attached = (await browserConn.send("Target.attachToTarget", {
+          targetId: pageTargetId,
+          flatten: true,
+        })) as { sessionId?: string };
+        if (!attached?.sessionId) throw new Error("Chromium Target.attachToTarget did not return a sessionId.");
+        pageSessionId = attached.sessionId;
+        await browserConn.send("Page.enable", {}, pageSessionId);
+        await browserConn.send("Runtime.enable", {}, pageSessionId);
+        await enableFetchBlocking();
+        touchIdle();
+        return;
+      } catch (e) {
+        lastError = e;
+        // Clean up this attempt before retrying.
+        try {
+          browserConn?.close();
+        } catch {
+          // ignore
+        }
+        browserConn = null;
+        pageSessionId = null;
+        pageTargetId = null;
+        if (browserProc) {
+          try {
+            browserProc.kill();
+          } catch {
+            // ignore
+          }
+          browserProc = null;
+        }
+        if (attempt === 0 && !envNoSandbox) {
+          console.error(`[pica] Chromium launch failed, retrying with --no-sandbox: ${String(e)}`);
+          continue;
+        }
+        await closeBrowser().catch(() => undefined);
+        throw e;
+      }
     }
+    await closeBrowser().catch(() => undefined);
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   })();
   try {
     await starting;
@@ -589,6 +630,131 @@ export async function screenshotAtTime(
   });
 }
 
+export async function screenshotInspectSinglePass(
+  svgText: string,
+  width: number,
+  height: number,
+  timeMs: number,
+  scale: number,
+  showGrid: boolean,
+  showIds: boolean,
+): Promise<Buffer> {
+  return withCdpLock(async () => {
+    await ensureBrowser();
+    if (!browserConn || !pageSessionId) throw new Error("Browser not started.");
+    const { w, h } = scaledSize(width, height, scale);
+    await applyViewport(w, h, pageSessionId);
+    await setDocumentHtml(htmlWrapper(svgText, w, h));
+    const t = Math.max(0, timeMs);
+    await runtimeEval(
+      `(async () => {
+        document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${t}; } catch (e) {} });
+        await new Promise((r) => requestAnimationFrame(() => r(1)));
+        document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${t}; } catch (e) {} });
+        return 'ok';
+      })()`,
+      true,
+    );
+    await runtimeEval(
+      `(() => {
+        const svg = document.querySelector('svg');
+        if (!svg) return 'no-svg';
+        const W = ${width};
+        const H = ${height};
+        const showGrid = ${showGrid ? "true" : "false"};
+        const showIds = ${showIds ? "true" : "false"};
+        const NS = 'http://www.w3.org/2000/svg';
+        let overlay = document.getElementById('pica-debug-overlay');
+        if (overlay) overlay.remove();
+        overlay = document.createElementNS(NS, 'g');
+        overlay.setAttribute('id', 'pica-debug-overlay');
+        overlay.setAttribute('pointer-events', 'none');
+        if (showGrid) {
+          for (let x = 100; x < W; x += 100) {
+            const ln = document.createElementNS(NS, 'line');
+            ln.setAttribute('x1', String(x));
+            ln.setAttribute('y1', '0');
+            ln.setAttribute('x2', String(x));
+            ln.setAttribute('y2', String(H));
+            ln.setAttribute('stroke', '#d4d4d8');
+            ln.setAttribute('stroke-width', '1');
+            ln.setAttribute('opacity', '0.7');
+            overlay.appendChild(ln);
+          }
+          for (let y = 100; y < H; y += 100) {
+            const ln = document.createElementNS(NS, 'line');
+            ln.setAttribute('x1', '0');
+            ln.setAttribute('y1', String(y));
+            ln.setAttribute('x2', String(W));
+            ln.setAttribute('y2', String(y));
+            ln.setAttribute('stroke', '#d4d4d8');
+            ln.setAttribute('stroke-width', '1');
+            ln.setAttribute('opacity', '0.7');
+            overlay.appendChild(ln);
+          }
+          const frame = document.createElementNS(NS, 'rect');
+          frame.setAttribute('x', '0.5');
+          frame.setAttribute('y', '0.5');
+          frame.setAttribute('width', String(W - 1));
+          frame.setAttribute('height', String(H - 1));
+          frame.setAttribute('fill', 'none');
+          frame.setAttribute('stroke', '#a1a1aa');
+          frame.setAttribute('stroke-width', '1');
+          overlay.appendChild(frame);
+        }
+        if (showIds) {
+          const svgRect = svg.getBoundingClientRect();
+          const root = document.querySelector('#pica-root');
+          const els = root ? Array.from(root.querySelectorAll('[id]')) : [];
+          for (const el of els) {
+            try {
+              const r = el.getBoundingClientRect();
+              const bx = r.left - svgRect.left;
+              const by = r.top - svgRect.top;
+              const bw = r.width;
+              const bh = r.height;
+              if (!(bw > 0 && bh > 0)) continue;
+              const id = el.id || '';
+              // Scale page px back to SVG units.
+              const sx = svgRect.width > 0 ? W / svgRect.width : 1;
+              const sy = svgRect.height > 0 ? H / svgRect.height : 1;
+              const ux = bx * sx;
+              const uy = by * sy;
+              const uw = bw * sx;
+              const uh = bh * sy;
+              const box = document.createElementNS(NS, 'rect');
+              box.setAttribute('x', String(ux));
+              box.setAttribute('y', String(uy));
+              box.setAttribute('width', String(uw));
+              box.setAttribute('height', String(uh));
+              box.setAttribute('fill', 'none');
+              box.setAttribute('stroke', '#2563eb');
+              box.setAttribute('stroke-width', '1.5');
+              overlay.appendChild(box);
+              const label = document.createElementNS(NS, 'text');
+              label.setAttribute('x', String(ux + 2));
+              label.setAttribute('y', String(Math.max(10, uy - 4)));
+              label.setAttribute('font-size', '11');
+              label.setAttribute('font-family', 'monospace');
+              label.setAttribute('fill', '#1d4ed8');
+              label.textContent = '#' + id;
+              overlay.appendChild(label);
+            } catch (e) {}
+          }
+        }
+        svg.appendChild(overlay);
+        return 'ok';
+      })()`,
+    );
+    const res = (await browserConn.send("Page.captureScreenshot", { format: "png", fromSurface: true }, pageSessionId)) as {
+      data?: string;
+    };
+    touchIdle();
+    if (!res?.data) throw new Error("Chromium Page.captureScreenshot returned no data.");
+    return Buffer.from(res.data, "base64");
+  });
+}
+
 export async function captureFrames(
   svgText: string,
   width: number,
@@ -604,11 +770,10 @@ export async function captureFrames(
     const { w, h } = scaledSize(width, height, scale);
     await applyViewport(w, h, pageSessionId);
     await setDocumentHtml(htmlWrapper(svgText, w, h));
-    // Integer frame loop: exact count, no floating-point drift.
     const safeFps = Math.max(1, fps);
     const totalFrames = Math.max(1, Math.round((durationMs / 1000) * safeFps));
     for (let i = 0; i < totalFrames; i++) {
-      const t = Math.round((i * 1000) / safeFps);
+      const t = (i * 1000) / safeFps;
       await runtimeEval(
         `(async () => {
           document.getAnimations().forEach((a) => { try { a.pause(); a.currentTime = ${t}; } catch (e) {} });

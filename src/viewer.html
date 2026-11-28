@@ -43,6 +43,7 @@
     left: 0; top: 0;
   }
   #artboard svg { display: block; }
+  #canvasframe { display: block; border: 0; pointer-events: none; background: transparent; }
   .checker {
     background-image:
       linear-gradient(45deg, #ececee 25%, transparent 25%),
@@ -75,7 +76,7 @@
 </header>
 <div id="stage">
   <div id="viewport">
-    <div id="artboard" class="checker"></div>
+    <div id="artboard" class="checker"><iframe id="canvasframe" sandbox="allow-same-origin" scrolling="no" style="border:0;display:block;pointer-events:none"></iframe></div>
   </div>
 </div>
 <footer>
@@ -142,9 +143,20 @@
   viewport.addEventListener('pointerup', () => { drag = null; viewport.classList.remove('dragging'); });
   fitBtn.addEventListener('click', fit);
 
+  function frameDoc() {
+    try {
+      const f = document.getElementById('canvasframe');
+      if (f && f.contentDocument) return f.contentDocument;
+    } catch (e) {}
+    return null;
+  }
   function allAnims() {
-    try { return document.getAnimations({ subtree: true }); }
-    catch (e) { return document.getAnimations(); }
+    const d = frameDoc();
+    if (!d) return [];
+    try { return d.getAnimations({ subtree: true }); }
+    catch (e) {
+      try { return d.getAnimations(); } catch (e2) { return []; }
+    }
   }
   playpause.addEventListener('click', () => {
     const anims = allAnims();
@@ -215,15 +227,11 @@
       currentPath = nextPath;
       filepathEl.textContent = currentPath || 'live svg';
       const dims = parseSvgDims(parsed.svg);
-      const pathChanged = parsed.svg && nextPath !== filepathEl.dataset.path;
+      const pathChanged = nextPath !== filepathEl.dataset.path;
       const dimsChanged = dims.w !== lastW || dims.h !== lastH;
       filepathEl.dataset.path = nextPath || '';
-      // Adopt the parsed node into the live document.
-      const svg = parsed.owned ? document.importNode(parsed.svg, true) : parsed.svg;
-      artboard.innerHTML = '';
-      artboard.appendChild(svg);
       try {
-        const meta = svg.querySelector('#pica-meta');
+        const meta = parsed.svg.querySelector('#pica-meta');
         if (meta && meta.textContent) {
           const j = JSON.parse(meta.textContent.trim());
           if (typeof j.durationMs === 'number') {
@@ -233,6 +241,14 @@
           }
         }
       } catch (e) {}
+      const frame = document.getElementById('canvasframe');
+      artboard.style.width = dims.w + 'px';
+      artboard.style.height = dims.h + 'px';
+      frame.setAttribute('width', String(dims.w));
+      frame.setAttribute('height', String(dims.h));
+      frame.style.width = dims.w + 'px';
+      frame.style.height = dims.h + 'px';
+      frame.srcdoc = '<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:transparent;overflow:hidden}svg{display:block}</style></head><body>' + text + '</body></html>';
       playing = true;
       playpause.textContent = 'Pause';
       // Only reset the camera on first load, path switch, or canvas resize.
@@ -241,7 +257,8 @@
         lastW = dims.w;
         lastH = dims.h;
         fittedOnce = true;
-        fit();
+        // Wait a tick so the iframe has layout before fitting.
+        requestAnimationFrame(fit);
       }
       statusEl.textContent = '';
     } catch (e) {
